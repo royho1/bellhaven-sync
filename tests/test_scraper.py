@@ -72,6 +72,20 @@ def test_facility_page_parses_address_and_care_type():
     assert "Assisted Living" in facility.care_types
 
 
+def test_one_line_address_with_full_state_name():
+    html = """
+    <html><body>
+      <h1>Bellhaven of New Carlisle</h1>
+      <div class="address">875 Elm Street, New Carlisle, Ohio 45344</div>
+    </body></html>
+    """
+    facility = scraper.parse_facility_page(html, f"{BASE}/communities/bellhaven-of-new-carlisle")
+    assert facility.street == "875 Elm Street"
+    assert facility.city == "New Carlisle"
+    assert facility.state == "OH"
+    assert facility.zip == "45344"
+
+
 def test_union_recovers_findlay_missing_from_listing():
     result = scraper.scrape_bellhaven(base_url=BASE, fetch=fixture_fetcher(), enrich_pages=True)
     urls = {f.url for f in result.facilities}
@@ -82,6 +96,13 @@ def test_union_recovers_findlay_missing_from_listing():
     assert result.sitemap_count == 5
 
 
+def test_facility_in_listing_and_sitemap_keeps_both_sources():
+    result = scraper.scrape_bellhaven(base_url=BASE, fetch=fixture_fetcher(), enrich_pages=True)
+    lima = next(f for f in result.facilities if "lima" in f.url)
+    assert "listing" in lima.sources
+    assert "sitemap" in lima.sources
+
+
 def test_short_union_raises_completeness_blocker():
     # Homepage claims 35; fixtures only produce 5. That is the Findlay-class gap.
     result = scraper.scrape_bellhaven(base_url=BASE, fetch=fixture_fetcher(), enrich_pages=True)
@@ -90,6 +111,20 @@ def test_short_union_raises_completeness_blocker():
     assert result.complete is False
     assert result.blockers
     assert "Suppressing missing-on-site" in result.blockers[0]
+
+
+def test_overcount_also_raises_completeness_blocker():
+    homepage = (FIXTURES / "homepage.html").read_text(encoding="utf-8").replace(
+        "35 communities", "3 communities"
+    )
+    result = scraper.scrape_bellhaven(
+        base_url=BASE,
+        fetch=fixture_fetcher({f"{BASE}/": homepage}),
+        enrich_pages=True,
+    )
+    assert result.claimed_count == 3
+    assert result.facility_count == 5
+    assert result.complete is False
 
 
 def test_complete_when_claim_matches_union():

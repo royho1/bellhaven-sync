@@ -211,12 +211,19 @@ def _parse_address_block(text: str) -> tuple[str, str, str, str]:
             else:
                 city = city_part or city
         else:
-            # "Findlay, Ohio 45840"
+            # "875 Elm Street, New Carlisle, Ohio 45840" or "Findlay, Ohio 45840"
             lower = before.lower()
             for name, abbrev in STATE_ABBREV.items():
                 if lower.endswith(name):
                     state = abbrev
-                    city = before[: -len(name)].strip(" ,")
+                    remainder = before[: -len(name)].strip(" ,")
+                    if "," in remainder:
+                        maybe_street, maybe_city = remainder.rsplit(",", 1)
+                        if re.search(r"\d", maybe_street) and not street:
+                            street = maybe_street.strip()
+                        city = maybe_city.strip() or city
+                    else:
+                        city = remainder or city
                     break
             if not state and "," in before:
                 left, right = before.rsplit(",", 1)
@@ -332,10 +339,11 @@ def scrape_bellhaven(
     # Internal links from the listing page itself (and later from facility pages)
     # catch facilities the listing cards omit.
     union: dict[str, list[str]] = {}
-    for url, source in {**sitemap_links, **listing_links}.items():
-        union.setdefault(url, [])
-        if source not in union[url]:
-            union[url].append(source)
+    for source_map in (sitemap_links, listing_links):
+        for url, source in source_map.items():
+            sources = union.setdefault(url, [])
+            if source not in sources:
+                sources.append(source)
 
     # Walk each listing page once for more internal community links.
     extra_pages = list(listing_links.keys())[:40]
@@ -374,7 +382,7 @@ def scrape_bellhaven(
             "Scrape completeness unknown: homepage had no parseable community count. "
             "Suppressing missing-on-site proposals until a claimed count is available."
         )
-    elif len(facilities) < claimed:
+    elif len(facilities) != claimed:
         complete = False
         blockers.append(
             f"Scrape incomplete: homepage claims {claimed} communities but the "
