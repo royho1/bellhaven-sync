@@ -86,6 +86,26 @@ def test_one_line_address_with_full_state_name():
     assert facility.zip == "45344"
 
 
+def test_one_line_address_does_not_treat_street_direction_as_state():
+    # "NE" is a valid two-letter token on many streets; the state must be the
+    # abbreviation immediately before the ZIP, not the first match.
+    street, city, state, zip5 = scraper._parse_address_block(
+        "123 NE Main St, Dayton, OH 45402"
+    )
+    assert street == "123 NE Main St"
+    assert city == "Dayton"
+    assert state == "OH"
+    assert zip5 == "45402"
+
+    street, city, state, zip5 = scraper._parse_address_block(
+        "500 US Highway 23, Toledo, OH 43604"
+    )
+    assert "US Highway 23" in street or street.startswith("500")
+    assert city == "Toledo"
+    assert state == "OH"
+    assert zip5 == "43604"
+
+
 def test_union_recovers_findlay_missing_from_listing():
     result = scraper.scrape_bellhaven(base_url=BASE, fetch=fixture_fetcher(), enrich_pages=True)
     urls = {f.url for f in result.facilities}

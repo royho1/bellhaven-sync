@@ -68,7 +68,9 @@ CLAIMED_COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
-STATE_RE = re.compile(r"\b([A-Z]{2})\b")
+# State abbreviation must sit at the end of the pre-ZIP text. Searching anywhere
+# would treat street tokens like NE/NW/US as the state.
+STATE_RE = re.compile(r"\b([A-Z]{2})\s*$")
 PHONE_RE = re.compile(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
 CARE_TYPES = (
     "Assisted Living",
