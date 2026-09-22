@@ -33,6 +33,32 @@ def cmd_discover(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_scrape(args: argparse.Namespace) -> int:
+    from datetime import datetime, timezone
+
+    from . import scraper
+
+    settings = load_settings()
+    result = scraper.scrape_bellhaven(
+        base_url=args.base_url,
+        settings=settings,
+        enrich_pages=not args.urls_only,
+    )
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out = settings.data_dir / "scrapes" / f"facilities-{stamp}.json"
+    scraper.save_facilities(result, out)
+
+    print(f"Claimed on homepage: {result.claimed_count}")
+    print(f"Listing links:       {result.listing_count}")
+    print(f"Sitemap links:       {result.sitemap_count}")
+    print(f"Union facilities:    {result.facility_count}")
+    print(f"Complete:            {result.complete}")
+    for blocker in result.blockers:
+        print(f"BLOCKER: {blocker}")
+    print(f"Saved to {out}")
+    return 0 if result.complete else 3
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bellhaven-sync", description=__doc__)
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
@@ -45,7 +71,29 @@ def build_parser() -> argparse.ArgumentParser:
     discover.add_argument("--page-size", type=int, default=50)
     discover.set_defaults(func=cmd_discover)
 
+    scrape = subparsers.add_parser(
+        "scrape",
+        help="read-only: scrape Bellhaven's public site into a local facility list",
+    )
+    scrape.add_argument(
+        "--base-url",
+        default=scraper_default_base(),
+        help="site origin (default: Bellhaven public site)",
+    )
+    scrape.add_argument(
+        "--urls-only",
+        action="store_true",
+        help="skip fetching individual facility pages (faster, less detail)",
+    )
+    scrape.set_defaults(func=cmd_scrape)
+
     return parser
+
+
+def scraper_default_base() -> str:
+    from .scraper import DEFAULT_SITE_BASE
+
+    return DEFAULT_SITE_BASE
 
 
 def main(argv: list[str] | None = None) -> int:

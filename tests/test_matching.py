@@ -1,0 +1,274 @@
+from __future__ import annotations
+
+from bellhaven_sync import fields
+from bellhaven_sync.matching import (
+    TIER_STREET_ZIP,
+    find_duplicates,
+    match_facilities,
+    resolve_parent,
+)
+from bellhaven_sync.scraper import Facility
+
+
+def _account(**kwargs):
+    base = {
+        fields.ACCOUNT_ID: "id",
+        fields.NAME: "Account",
+        fields.PARENT_ID: "",
+        fields.STREET: "",
+        fields.CITY: "",
+        fields.STATE: "",
+        fields.ZIP: "",
+        fields.STATUS: "Active",
+    }
+    base.update(kwargs)
+    return base
+
+
+def _facility(**kwargs):
+    defaults = dict(name="Facility", url="https://example.test/communities/facility")
+    defaults.update(kwargs)
+    return Facility(**defaults)
+
+
+def test_tier1_exact_street_and_zip():
+    facility = _facility(
+        name="Bellhaven Meadows of Findlay",
+        street="1800 N Blanchard St",
+        city="Findlay",
+        state="OH",
+        zip="45840",
+    )
+    account = _account(
+        **{
+            fields.ACCOUNT_ID: "A1",
+            fields.NAME: "Bellhaven Meadows of Findlay",
+            fields.STREET: "1800 North Blanchard Street",
+            fields.CITY: "Findlay",
+            fields.STATE: "OH",
+            fields.ZIP: "45840",
+        }
+    )
+
+    results = match_facilities([facility], [account])
+    assert results[0].account["account_id"] == "A1"
+    assert results[0].tier == TIER_STREET_ZIP
+    assert results[0].confidence == "high"
+
+
+def test_carlisle_pa_never_matches_new_carlisle_oh():
+    # Hard state gate. Name similarity alone must never bridge this.
+    ohio = _facility(
+        name="Bellhaven of New Carlisle",
+        street="875 Elm St",
+        city="New Carlisle",
+        state="OH",
+        zip="45344",
+        url="https://example.test/communities/new-carlisle",
+    )
+    pa = _account(
+        **{
+            fields.ACCOUNT_ID: "PA1",
+            fields.NAME: "Bellhaven of Carlisle",
+            fields.STREET: "875 Elm Street",
+            fields.CITY: "Carlisle",
+            fields.STATE: "PA",
+            fields.ZIP: "17013",
+        }
+    )
+
+    results = match_facilities([ohio], [pa])
+    assert results[0].account is None
+    assert results[0].confidence == "none"
+
+
+def test_name_only_similarity_never_matches():
+    facility = _facility(name="Bellhaven of Tiffin", city="Tiffin", state="OH")
+    account = _account(
+        **{
+            fields.ACCOUNT_ID: "T1",
+            fields.NAME: "Bellhaven of Tiffin",
+            fields.CITY: "Toledo",  # different city, no street
+            fields.STATE: "OH",
+        }
+    )
+
+    results = match_facilities([facility], [account])
+    assert results[0].account is None
+
+
+def test_ambiguity_margin_produces_review_item_not_action():
+    facility = _facility(
+        name="Bellhaven Care Center",
+        street="100 Main St",
+        city="Dayton",
+        state="OH",
+        zip="45402",
+    )
+    a1 = _account(
+        **{
+            fields.ACCOUNT_ID: "D1",
+            fields.NAME: "Bellhaven Care Center East",
+            fields.STREET: "100 Main Street",
+            fields.CITY: "Dayton",
+            fields.STATE: "OH",
+            fields.ZIP: "45402",
+        }
+    )
+    a2 = _account(
+        **{
+            fields.ACCOUNT_ID: "D2",
+            fields.NAME: "Bellhaven Care Center West",
+            fields.STREET: "100 Main Street",
+            fields.CITY: "Dayton",
+            fields.STATE: "OH",
+            fields.ZIP: "45402",
+        }
+    )
+
+    results = match_facilities([facility], [a1, a2])
+    assert results[0].ambiguous is True
+    assert results[0].account is None
+    assert results[0].confidence == "ambiguous"
+    assert len(results[0].runners_up) >= 2
+
+
+def test_greedy_assignment_is_one_to_one():
+    f1 = _facility(
+        name="Alpha",
+        street="1 Oak St",
+        city="Akron",
+        state="OH",
+        zip="44301",
+        url="https://example.test/a",
+    )
+    f2 = _facility(
+        name="Beta",
+        street="1 Oak St",
+        city="Akron",
+        state="OH",
+        zip="44301",
+        url="https://example.test/b",
+    )
+    account = _account(
+        **{
+            fields.ACCOUNT_ID: "ONLY",
+            fields.NAME: "Alpha",
+            fields.STREET: "1 Oak Street",
+            fields.CITY: "Akron",
+            fields.STATE: "OH",
+            fields.ZIP: "44301",
+        }
+    )
+
+    results = match_facilities([f1, f2], [account])
+    matched = [r for r in results if r.account is not None]
+    assert len(matched) == 1
+
+
+def test_duplicate_grouping_by_street_zip():
+    a1 = _account(
+        **{
+            fields.ACCOUNT_ID: "O1",
+            fields.NAME: "Bellhaven of Owosso",
+            fields.STREET: "1120 W Main St",
+            fields.CITY: "Owosso",
+            fields.STATE: "MI",
+            fields.ZIP: "48867",
+        }
+    )
+    a2 = _account(
+        **{
+            fields.ACCOUNT_ID: "O2",
+            fields.NAME: "Bellhaven of Owosso",
+            fields.STREET: "1120 West Main Street",
+            fields.CITY: "Owosso",
+            fields.STATE: "MI",
+            fields.ZIP: "48867",
+        }
+    )
+    unique = _account(
+        **{
+            fields.ACCOUNT_ID: "U1",
+            fields.NAME: "Bellhaven of Saline",
+            fields.STREET: "980 West Michigan Avenue",
+            fields.CITY: "Saline",
+            fields.STATE: "MI",
+            fields.ZIP: "48176",
+        }
+    )
+
+    groups = find_duplicates([a1, a2, unique])
+    assert len(groups) == 1
+    ids = {a[fields.ACCOUNT_ID] for a in groups[0].accounts}
+    assert ids == {"O1", "O2"}
+
+
+def test_parent_resolves_when_exactly_one_match():
+    parent = _account(
+        **{
+            fields.ACCOUNT_ID: "0015QAPLGS3FVYEEEM",
+            fields.NAME: "Bellhaven Senior Living (Parent Account)",
+            fields.PARENT_ID: "",
+        }
+    )
+    child = _account(
+        **{
+            fields.ACCOUNT_ID: "C1",
+            fields.NAME: "Bellhaven of Tiffin",
+            fields.PARENT_ID: "0015QAPLGS3FVYEEEM",
+        }
+    )
+    other = _account(
+        **{
+            fields.ACCOUNT_ID: "P2",
+            fields.NAME: "Harborview Care Group (Parent Account)",
+            fields.PARENT_ID: "",
+        }
+    )
+
+    result = resolve_parent([parent, child, other])
+    assert result.resolved
+    assert result.account_id == "0015QAPLGS3FVYEEEM"
+    assert result.blocker is None
+
+
+def test_parent_stops_when_multiple_plausible():
+    p1 = _account(
+        **{
+            fields.ACCOUNT_ID: "P1",
+            fields.NAME: "Bellhaven Senior Living (Parent Account)",
+            fields.PARENT_ID: "",
+        }
+    )
+    p2 = _account(
+        **{
+            fields.ACCOUNT_ID: "P2",
+            fields.NAME: "Bellhaven Senior Living",
+            fields.PARENT_ID: "",
+        }
+    )
+
+    result = resolve_parent([p1, p2])
+    assert not result.resolved
+    assert result.blocker and "Multiple plausible" in result.blocker
+    assert len(result.candidates) == 2
+
+
+def test_parent_override_wins():
+    p1 = _account(**{fields.ACCOUNT_ID: "P1", fields.NAME: "Bellhaven Senior Living (Parent Account)"})
+    result = resolve_parent([p1], override_id="P1")
+    assert result.account_id == "P1"
+
+
+def test_parent_never_uses_child_count_as_tiebreaker():
+    # Two root "bellhaven" names: resolution must stop, even if one has more kids.
+    big = _account(**{fields.ACCOUNT_ID: "BIG", fields.NAME: "Bellhaven Senior Living (Parent Account)"})
+    small = _account(**{fields.ACCOUNT_ID: "SMALL", fields.NAME: "Bellhaven Senior Living"})
+    kids = [
+        _account(**{fields.ACCOUNT_ID: f"K{i}", fields.NAME: f"Kid {i}", fields.PARENT_ID: "BIG"})
+        for i in range(5)
+    ]
+    result = resolve_parent([big, small, *kids])
+    assert result.blocker is not None
+    assert result.account_id is None

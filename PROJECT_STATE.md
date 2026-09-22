@@ -67,6 +67,10 @@ corrections, apply only what a human approves.
   mistaken for stale CRM data.
 - Individual facility pages carry address and care-offering detail.
 - The About page references Harborview Care Group and Cedar Trail acquisitions.
+- As of Branch 2 development, `bellhavenseniorliving.com` does not resolve in DNS
+  (NXDOMAIN). Scraper behavior is covered by fixture HTML under `tests/fixtures/html/`.
+  Live `cli scrape` will fail until the assessment site is reachable; matching and
+  normalization do not depend on the live site.
 
 ## Architecture decisions
 
