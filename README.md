@@ -1,2 +1,57 @@
-# clipboard-crm-reconciliation
-CRM reconciliation pipeline that matches Bellhaven Senior Living locations to CRM accounts, surfaces discrepancies for review, and safely applies approved updates.
+# bellhaven-sync
+
+CRM reconciliation for Bellhaven Senior Living. The system scrapes Bellhaven's public
+website, reads the Clipboard CRM, proposes conservative corrections, and applies only
+what a human approves.
+
+Nothing is written to the CRM without an explicit approval. The scheduled job is
+read-only by construction: it cannot reach a write method.
+
+## Status
+
+Phase 0 (`feat/schema-discovery`) is in place: configuration, a GET-only CRM client,
+and a read-only schema probe. The scraper, matcher, proposal store, review app, and
+the apply path land in later branches.
+
+## Setup
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cp .env.example .env    # then paste your token into .env
+```
+
+`.env` is gitignored. The API token is read from the environment only. It is never
+committed, never logged, and never written into a snapshot or a document: everything
+that could carry it passes through `redact()` first.
+
+## Commands
+
+```bash
+# Read-only: confirm the token, page through every account, print the observed
+# schema, and save a local snapshot under data/snapshots/.
+.venv/bin/python -m bellhaven_sync.cli discover
+```
+
+## Tests
+
+```bash
+.venv/bin/python -m pytest
+```
+
+Tests never touch the network. HTTP is stubbed with a fake session that only
+implements `get`.
+
+## Safety model
+
+- `bellhaven_sync/crm_client.py` is GET-only and stays that way.
+- All POST and PATCH capability will live in `bellhaven_sync/apply.py`, which the
+  sync path never imports. `tests/test_write_boundary.py` walks the transitive import
+  graph and fails if that ever changes.
+- The CHOW rule (change of ownership) is isolated in its own module so it can be read
+  and verified in one screen.
+
+## Docs
+
+- `docs/schema-findings.md`: what the live API actually returns, observed rather than
+  assumed, since the OpenAPI spec leaves the account schema empty.

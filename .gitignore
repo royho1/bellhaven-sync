@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# bellhaven-sync
+.env
+.env.*
+!.env.example
+data/
+*.db
+.DS_Store
