@@ -30,6 +30,11 @@ class FakeSession:
     def __init__(self, responses: list[FakeResponse] | None = None):
         self.responses = list(responses or [])
         self.calls: list[dict[str, Any]] = []
+        self.headers: dict[str, str] = {}
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
     def get(self, url: str, params: dict[str, Any] | None = None, timeout: Any = None) -> FakeResponse:
         self.calls.append({"url": url, "params": params or {}, "timeout": timeout})

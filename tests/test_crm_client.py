@@ -202,6 +202,83 @@ def test_missing_token_raises_a_helpful_config_error(monkeypatch, tmp_path):
     assert "CLIPBOARD_API_TOKEN" in str(exc.value)
 
 
+def _settings_for(tmp_path, *, token: str, base_url: str) -> config.Settings:
+    return config.Settings(
+        api_token=token,
+        base_url=base_url,
+        dry_run=True,
+        bellhaven_parent_account_id=None,
+        data_dir=tmp_path / "data",
+    )
+
+
+@pytest.fixture
+def recording_builder(monkeypatch):
+    """Replace the session factory so no real socket is ever opened."""
+    built: list[FakeSession] = []
+
+    def fake_build(settings: config.Settings) -> FakeSession:
+        session = FakeSession([FakeResponse({"ok": True}) for _ in range(5)])
+        session.headers = {"Authorization": f"Bearer {settings.api_token}"}
+        built.append(session)
+        return session
+
+    monkeypatch.setattr(crm_client, "build_session", fake_build)
+    return built
+
+
+def test_cached_session_is_reused_for_identical_settings(tmp_path, recording_builder):
+    settings = _settings_for(tmp_path, token="token-a", base_url="https://a.example.test/api/v1")
+
+    crm_client.get_me(settings=settings)
+    crm_client.get_me(settings=settings)
+
+    assert len(recording_builder) == 1
+
+
+def test_cached_session_is_rebuilt_when_the_token_or_base_url_changes(tmp_path, recording_builder):
+    # The leak this guards against: reusing environment A's Authorization header
+    # while sending the request to environment B's host.
+    settings_a = _settings_for(tmp_path, token="token-a", base_url="https://a.example.test/api/v1")
+    settings_b = _settings_for(tmp_path, token="token-b", base_url="https://b.example.test/api/v1")
+
+    crm_client.get_me(settings=settings_a)
+    crm_client.get_me(settings=settings_b)
+
+    assert len(recording_builder) == 2
+    session_a, session_b = recording_builder
+
+    assert session_a.calls[0]["url"].startswith("https://a.example.test")
+    assert session_a.headers["Authorization"] == "Bearer token-a"
+    assert session_b.calls[0]["url"].startswith("https://b.example.test")
+    assert session_b.headers["Authorization"] == "Bearer token-b"
+    assert session_a.closed
+
+
+def test_cached_session_is_rebuilt_when_only_the_token_rotates(tmp_path, recording_builder):
+    base_url = "https://a.example.test/api/v1"
+    old = _settings_for(tmp_path, token="token-old", base_url=base_url)
+    new = _settings_for(tmp_path, token="token-new", base_url=base_url)
+
+    crm_client.get_me(settings=old)
+    crm_client.get_me(settings=new)
+
+    assert [s.headers["Authorization"] for s in recording_builder] == [
+        "Bearer token-old",
+        "Bearer token-new",
+    ]
+
+
+def test_explicit_session_is_never_replaced_by_the_cache(tmp_path, recording_builder):
+    settings = _settings_for(tmp_path, token="token-a", base_url="https://a.example.test/api/v1")
+    injected = FakeSession([FakeResponse({"ok": True})])
+
+    crm_client.get_me(session=injected, settings=settings)
+
+    assert injected.calls
+    assert recording_builder == []
+
+
 def test_module_exposes_no_write_helpers():
     forbidden = {"post", "patch", "put", "delete"}
     exposed = {name.lower() for name in dir(crm_client) if not name.startswith("__")}

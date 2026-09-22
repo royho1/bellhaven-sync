@@ -40,24 +40,40 @@ class CrmError(RuntimeError):
 
 
 _session: requests.Session | None = None
+_session_key: tuple[str, str] | None = None
+
+
+def _session_key_for(settings: Settings) -> tuple[str, str]:
+    return (settings.base_url, settings.api_token)
 
 
 def _resolve(session: requests.Session | None, settings: Settings | None) -> tuple[Any, Settings]:
-    global _session
+    """Return the session to use and the settings it belongs to.
+
+    The cached session carries an Authorization header, so it is keyed on the
+    token and base URL it was built from. Without that, a second call with
+    different settings would send the first token to the second host.
+    """
+    global _session, _session_key
     resolved_settings = settings or load_settings()
     if session is not None:
         return session, resolved_settings
-    if _session is None:
+
+    key = _session_key_for(resolved_settings)
+    if _session is None or _session_key != key:
+        reset_session()
         _session = build_session(resolved_settings)
+        _session_key = key
     return _session, resolved_settings
 
 
 def reset_session() -> None:
     """Drop the cached session. Used by tests and after a settings reload."""
-    global _session
+    global _session, _session_key
     if _session is not None:
         _session.close()
     _session = None
+    _session_key = None
 
 
 def _describe_failure(status: int, body: str) -> str:
