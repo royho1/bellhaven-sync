@@ -70,6 +70,22 @@ def test_field_summary_counts_nulls_and_types():
     assert "duplicate_of_account" in report["always_null"]
 
 
+def test_empty_strings_count_as_unset_not_populated():
+    # The live API uses "" rather than null, so a blank-unaware summary would
+    # report every field as fully populated.
+    accounts = [
+        {"account_id": "A1", "note": "", "chow_current_account": ""},
+        {"account_id": "A2", "note": "real note", "chow_current_account": ""},
+    ]
+
+    report = schema_probe.analyze_accounts(accounts)
+
+    assert report["fields"]["note"]["non_blank"] == 1
+    assert report["fields"]["note"]["blank"] == 1
+    assert "chow_current_account" in report["always_null"]
+    assert "account_id" in report["always_populated"]
+
+
 def test_status_values_are_enumerated():
     report = schema_probe.analyze_accounts(ACCOUNTS)
 

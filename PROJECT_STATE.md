@@ -37,8 +37,22 @@ corrections, apply only what a human approves.
 - `GET /accounts` pagination: `page` (default 1) and `page_size` (default 50).
 - `GET /accounts` filters: `q`, `city`, `state`, `zip`, `street`, `parent_id`.
 - The OpenAPI spec does NOT document the account schema; request and response bodies
-  are effectively empty objects. Field names and types are observed empirically and
-  recorded in `docs/schema-findings.md`.
+  are effectively empty objects. Field names and types were observed empirically and
+  are recorded in `docs/schema-findings.md`.
+- Confirmed by the Phase 0 run (121 accounts): the list envelope is
+  `{"data": [...], "page", "page_size", "total"}`. The identifier is `account_id`,
+  not `id`. Address fields are `billing_street`, `billing_city`, `billing_state`,
+  `billing_zip`. Status is `Active` or `Inactive`.
+- The API NEVER returns null. Unset fields come back as `""`. Use
+  `fields.is_set()`; a blank-unaware check reports every field as populated.
+- `lifetime_revenue` and `outstanding_ar` are plain ints, never null, never
+  negative. Every account with positive AR also has positive revenue, so the
+  ambiguous zero-revenue-with-AR branch does not occur in this data.
+- The Bellhaven parent is `0015QAPLGS3FVYEEEM`, named "Bellhaven Senior Living
+  (Parent Account)". Name normalization must strip the `(Parent Account)` suffix.
+  It is the only match, so the resolver does not have to stop on this data.
+- `created_by_candidate` is False on every existing account, which gives the apply
+  path a cheap way to recognize accounts this tool created.
 - No documented rate limit. Requests are sequential with explicit timeouts; no
   invented throttle.
 
