@@ -213,9 +213,10 @@ def _parse_address_block(text: str) -> tuple[str, str, str, str]:
             else:
                 city = city_part or city
         else:
-            # "875 Elm Street, New Carlisle, Ohio 45840" or "Findlay, Ohio 45840"
+            # "875 Elm Street, New Carlisle, Ohio 45840" or "Findlay, Ohio 45840".
+            # Longest name first so "West Virginia" is not eaten by "Virginia".
             lower = before.lower()
-            for name, abbrev in STATE_ABBREV.items():
+            for name, abbrev in sorted(STATE_ABBREV.items(), key=lambda kv: -len(kv[0])):
                 if lower.endswith(name):
                     state = abbrev
                     remainder = before[: -len(name)].strip(" ,")
@@ -363,6 +364,7 @@ def scrape_bellhaven(
                 sources.append(source)
 
     facilities: list[Facility] = []
+    enrichment_failures: list[str] = []
     for url, sources in sorted(union.items()):
         if enrich_pages:
             try:
@@ -371,6 +373,7 @@ def scrape_bellhaven(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("could not parse facility page %s: %s", url, exc)
                 facility = Facility(name=_slug_to_name(url), url=url)
+                enrichment_failures.append(url)
         else:
             facility = Facility(name=_slug_to_name(url), url=url)
         facility.sources = sources
@@ -390,6 +393,13 @@ def scrape_bellhaven(
             f"Scrape incomplete: homepage claims {claimed} communities but the "
             f"union of listing + sitemap + internal links found {len(facilities)}. "
             "Suppressing missing-on-site proposals until the gap is closed."
+        )
+    if enrichment_failures:
+        complete = False
+        blockers.append(
+            f"Facility enrichment failed for {len(enrichment_failures)} URL(s); "
+            "those records lack address evidence. Suppressing missing-on-site "
+            "proposals until enrichment succeeds."
         )
 
     return ScrapeResult(

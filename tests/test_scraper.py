@@ -106,6 +106,34 @@ def test_one_line_address_does_not_treat_street_direction_as_state():
     assert zip5 == "43604"
 
 
+def test_full_state_name_prefers_longest_match():
+    street, city, state, zip5 = scraper._parse_address_block(
+        "100 Capitol St, Charleston, West Virginia 25301"
+    )
+    assert street == "100 Capitol St"
+    assert city == "Charleston"
+    assert state == "WV"
+    assert zip5 == "25301"
+
+
+def test_enrichment_failure_marks_scrape_incomplete():
+    homepage = (FIXTURES / "homepage.html").read_text(encoding="utf-8").replace(
+        "35 communities", "5 communities"
+    )
+    base_fetch = fixture_fetcher({f"{BASE}/": homepage})
+
+    def flaky(url: str) -> str:
+        if url.endswith("bellhaven-of-tiffin"):
+            raise RuntimeError("boom")
+        return base_fetch(url)
+
+    result = scraper.scrape_bellhaven(base_url=BASE, fetch=flaky, enrich_pages=True)
+    assert result.facility_count == 5
+    assert result.claimed_count == 5
+    assert result.complete is False
+    assert any("enrichment failed" in b.lower() for b in result.blockers)
+
+
 def test_union_recovers_findlay_missing_from_listing():
     result = scraper.scrape_bellhaven(base_url=BASE, fetch=fixture_fetcher(), enrich_pages=True)
     urls = {f.url for f in result.facilities}

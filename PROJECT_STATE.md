@@ -90,6 +90,28 @@ Four branches, each reviewed and merged before the next starts:
 `feat/schema-discovery`, `feat/scrape-and-match`, `feat/proposals-and-review`,
 `feat/apply-and-schedule`.
 
+## Current status (2026-09-21 evening)
+
+- Branch 1 `feat/schema-discovery` is merged to `main`.
+- Branch 2 `feat/scrape-and-match` is open as [PR #2](https://github.com/royho1/bellhaven-sync/pull/2).
+  **Do not merge tonight.** Waiting on a clean Codex review (no P1/P2).
+- Latest Branch 2 fixes (not yet reviewed clean):
+  - State abbreviation is the two-letter token immediately before the ZIP, so
+    street tokens like `NE` / `US` are not mistaken for the state.
+  - Full state-name parsing prefers the longest terminal match, so
+    `West Virginia` resolves to `WV`, not `VA`.
+  - Facility enrichment failures (fetch/parse errors) force `complete=False` even
+    when the URL count matches the homepage claim.
+  - House numbers are required for tier-1/2 matches and street+ZIP duplicate keys.
+  - Completeness requires an exact homepage-count match (undercount and overcount
+    both block), and a missing claimed count also blocks.
+  - Listing and sitemap provenance tags are merged independently.
+- Test suite on this branch: 74 passed, fixture-based, no network required for
+  scraper/matcher tests.
+- Live site `bellhavenseniorliving.com` still NXDOMAIN; do not treat a failed live
+  scrape as a product bug.
+- Next after a clean merge of PR #2: `feat/proposals-and-review`.
+
 ## Open questions
 
 - Whether a `lifetime_revenue` of exactly zero means "no revenue history". Until the
