@@ -53,10 +53,12 @@ DIRECTION_ABBREV = {
     "southwest": "sw",
 }
 
-UNIT_RE = re.compile(
-    r"\b(?:suite|ste|unit|apt|apartment|#)\s*[a-z0-9-]+\b",
+UNIT_WORD_RE = re.compile(
+    r"\b(?:suite|ste|unit|apt|apartment)\s*[a-z0-9-]+\b",
     re.IGNORECASE,
 )
+# "#2" / " # 2" cannot use \b before "#", so handle the hash form separately.
+UNIT_HASH_RE = re.compile(r"#\s*[a-z0-9-]+\b", re.IGNORECASE)
 PAREN_RE = re.compile(r"\([^)]*\)")
 NON_ALNUM_RE = re.compile(r"[^a-z0-9\s]")
 MULTI_SPACE_RE = re.compile(r"\s+")
@@ -121,7 +123,8 @@ def normalize_street(value: str | None) -> tuple[str, str]:
     if not value:
         return "", ""
     text = value.lower().strip()
-    text = UNIT_RE.sub(" ", text)
+    text = UNIT_WORD_RE.sub(" ", text)
+    text = UNIT_HASH_RE.sub(" ", text)
     text = NON_ALNUM_RE.sub(" ", text)
     text = _collapse(text)
 

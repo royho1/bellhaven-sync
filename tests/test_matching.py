@@ -56,6 +56,70 @@ def test_tier1_exact_street_and_zip():
     assert results[0].confidence == "high"
 
 
+def test_same_street_different_house_number_does_not_tier1_match():
+    # House numbers live outside `street` after normalization; tiers 1 and 2
+    # must still require them to match or 100 Main and 200 Main collide.
+    facility = _facility(
+        name="Bellhaven Alpha",
+        street="100 Main St",
+        city="Dayton",
+        state="OH",
+        zip="45402",
+    )
+    account = _account(
+        **{
+            fields.ACCOUNT_ID: "B1",
+            fields.NAME: "Bellhaven Beta",
+            fields.STREET: "200 Main Street",
+            fields.CITY: "Dayton",
+            fields.STATE: "OH",
+            fields.ZIP: "45402",
+        }
+    )
+
+    results = match_facilities([facility], [account])
+    assert results[0].account is None
+    assert results[0].confidence == "none"
+
+
+def test_duplicate_grouping_requires_same_house_number():
+    a1 = _account(
+        **{
+            fields.ACCOUNT_ID: "O1",
+            fields.NAME: "Bellhaven of Owosso",
+            fields.STREET: "1120 W Main St",
+            fields.CITY: "Owosso",
+            fields.STATE: "MI",
+            fields.ZIP: "48867",
+        }
+    )
+    a2 = _account(
+        **{
+            fields.ACCOUNT_ID: "O2",
+            fields.NAME: "Bellhaven of Owosso",
+            fields.STREET: "1120 West Main Street",
+            fields.CITY: "Owosso",
+            fields.STATE: "MI",
+            fields.ZIP: "48867",
+        }
+    )
+    neighbor = _account(
+        **{
+            fields.ACCOUNT_ID: "O3",
+            fields.NAME: "Other Place on Main",
+            fields.STREET: "1200 West Main Street",
+            fields.CITY: "Owosso",
+            fields.STATE: "MI",
+            fields.ZIP: "48867",
+        }
+    )
+
+    groups = find_duplicates([a1, a2, neighbor])
+    assert len(groups) == 1
+    ids = {a[fields.ACCOUNT_ID] for a in groups[0].accounts}
+    assert ids == {"O1", "O2"}
+
+
 def test_carlisle_pa_never_matches_new_carlisle_oh():
     # Hard state gate. Name similarity alone must never bridge this.
     ohio = _facility(

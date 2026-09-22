@@ -21,6 +21,12 @@ def test_unit_designators_are_stripped():
     assert street == "main st"
 
 
+def test_hash_unit_designators_are_stripped():
+    # "#2" has no word boundary before the hash, so it needs its own pattern.
+    assert normalize_street("100 Main St #2") == normalize_street("100 Main St")
+    assert normalize_street("100 Main St #2") == ("100", "main st")
+
+
 def test_zip_keeps_first_five_digits():
     assert normalize_zip("45344-1234") == "45344"
     assert normalize_zip("45344") == "45344"

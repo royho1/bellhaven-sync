@@ -368,7 +368,13 @@ def scrape_bellhaven(
 
     blockers: list[str] = []
     complete = True
-    if claimed is not None and len(facilities) < claimed:
+    if claimed is None:
+        complete = False
+        blockers.append(
+            "Scrape completeness unknown: homepage had no parseable community count. "
+            "Suppressing missing-on-site proposals until a claimed count is available."
+        )
+    elif len(facilities) < claimed:
         complete = False
         blockers.append(
             f"Scrape incomplete: homepage claims {claimed} communities but the "

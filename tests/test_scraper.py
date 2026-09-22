@@ -104,6 +104,18 @@ def test_complete_when_claim_matches_union():
     assert result.blockers == []
 
 
+def test_missing_claimed_count_is_a_completeness_blocker():
+    homepage = "<html><body><h1>Bellhaven</h1><p>Welcome.</p></body></html>"
+    result = scraper.scrape_bellhaven(
+        base_url=BASE,
+        fetch=fixture_fetcher({f"{BASE}/": homepage}),
+        enrich_pages=True,
+    )
+    assert result.claimed_count is None
+    assert result.complete is False
+    assert any("completeness unknown" in b.lower() for b in result.blockers)
+
+
 def test_claimed_count_parser():
     html = (FIXTURES / "homepage.html").read_text(encoding="utf-8")
     assert scraper.parse_claimed_count(html) == 35

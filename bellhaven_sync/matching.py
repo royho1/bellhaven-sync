@@ -100,20 +100,27 @@ def _score_pair(facility: NormalizedLocation, account: NormalizedLocation) -> Ma
     sim = name_similarity(facility.name, account.name)
     account_id = ""  # filled by caller
 
-    if facility.street and account.street and facility.street == account.street:
+    if (
+        facility.street
+        and account.street
+        and facility.street == account.street
+        and facility.house_number
+        and account.house_number
+        and facility.house_number == account.house_number
+    ):
         if facility.zip5 and account.zip5 and facility.zip5 == account.zip5:
             return MatchCandidate(
                 account_id=account_id,
                 tier=TIER_STREET_ZIP,
                 name_similarity=sim,
-                reasons=("same state", "same street", "same ZIP"),
+                reasons=("same state", "same house number", "same street", "same ZIP"),
             )
         if facility.city and account.city and facility.city == account.city:
             return MatchCandidate(
                 account_id=account_id,
                 tier=TIER_STREET_CITY,
                 name_similarity=sim,
-                reasons=("same state", "same street", "same city", "ZIP differs"),
+                reasons=("same state", "same house number", "same street", "same city", "ZIP differs"),
             )
 
     if (
@@ -263,8 +270,8 @@ def find_duplicates(accounts: Iterable[dict[str, Any]]) -> list[DuplicateGroup]:
         norm = account_location(account)
         if not norm.state:
             continue
-        if norm.street and norm.zip5:
-            key = ("street_zip", f"{norm.state}|{norm.street}|{norm.zip5}")
+        if norm.street and norm.zip5 and norm.house_number:
+            key = ("street_zip", f"{norm.state}|{norm.house_number}|{norm.street}|{norm.zip5}")
             groups.setdefault(key, []).append(account)
         if norm.city and norm.name:
             key = ("city_name", f"{norm.state}|{norm.city}|{norm.name}")
@@ -281,7 +288,7 @@ def find_duplicates(accounts: Iterable[dict[str, Any]]) -> list[DuplicateGroup]:
             continue
         seen_ids.add(ids)
         reason = (
-            "same state, street, and ZIP"
+            "same state, house number, street, and ZIP"
             if kind == "street_zip"
             else "same state, city, and normalized name"
         )
