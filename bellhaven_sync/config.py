@@ -37,6 +37,12 @@ class Settings:
     bellhaven_parent_account_id: str | None
     data_dir: Path
 
+    def __post_init__(self) -> None:
+        # Registering here rather than in load_settings() means a token is
+        # redactable however the Settings were built, including directly by a
+        # caller or a test that never touches the environment.
+        register_secret(self.api_token)
+
     @property
     def snapshot_dir(self) -> Path:
         return self.data_dir / "snapshots"
@@ -81,7 +87,6 @@ def load_settings(*, env_file: Path | None = None, force: bool = False) -> Setti
             "CLIPBOARD_API_TOKEN is not set. Copy .env.example to .env and put the "
             "token there, or export it in your shell. The token is never committed."
         )
-    register_secret(token)
 
     base_url = (os.environ.get("CLIPBOARD_API_BASE_URL") or DEFAULT_BASE_URL).strip().rstrip("/")
     parent_id = (os.environ.get("BELLHAVEN_PARENT_ACCOUNT_ID") or "").strip() or None

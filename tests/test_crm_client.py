@@ -279,6 +279,49 @@ def test_explicit_session_is_never_replaced_by_the_cache(tmp_path, recording_bui
     assert recording_builder == []
 
 
+def test_directly_constructed_settings_register_their_token_for_redaction(tmp_path):
+    # Not every Settings comes from load_settings(); redaction cannot depend on
+    # which path built it.
+    config.reset_settings()
+    secret = "directly-built-token-9999"
+
+    _settings_for(tmp_path, token=secret, base_url="https://a.example.test/api/v1")
+
+    assert secret not in config.redact(f"leaked {secret}")
+
+
+def test_a_token_from_explicit_settings_never_leaks_into_errors_or_logs(tmp_path, caplog):
+    config.reset_settings()
+    secret = "explicit-settings-token-4242"
+    settings = _settings_for(tmp_path, token=secret, base_url="https://a.example.test/api/v1")
+    # 422 echoes the response body back into the message, so this is the path
+    # where an unregistered token would actually surface.
+    session = FakeSession([FakeResponse(status_code=422, text=f"bad token {secret}")])
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(crm_client.CrmError) as exc:
+            crm_client.get_me(session=session, settings=settings)
+
+    assert secret not in str(exc.value)
+    assert secret not in caplog.text
+    assert config.REDACTION_PLACEHOLDER in str(exc.value)
+
+
+def test_a_token_from_explicit_settings_is_redacted_in_connection_errors(tmp_path):
+    config.reset_settings()
+    secret = "explicit-settings-token-7331"
+    settings = _settings_for(tmp_path, token=secret, base_url="https://a.example.test/api/v1")
+
+    class LeakySession:
+        def get(self, *_args, **_kwargs):
+            raise requests.ConnectionError(f"handshake failed for {secret}")
+
+    with pytest.raises(crm_client.CrmError) as exc:
+        crm_client.get_me(session=LeakySession(), settings=settings)
+
+    assert secret not in str(exc.value)
+
+
 def test_module_exposes_no_write_helpers():
     forbidden = {"post", "patch", "put", "delete"}
     exposed = {name.lower() for name in dir(crm_client) if not name.startswith("__")}
