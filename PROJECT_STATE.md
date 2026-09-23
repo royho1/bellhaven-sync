@@ -122,8 +122,11 @@ Four branches, each reviewed and merged before the next starts:
      and never overwrite prior review status. Review UI defaults to the latest run.
   9. `cli sync` and `cli serve` are CRM-read-only; approve/reject only updates SQLite.
   10. Incomplete scrape or unresolved parent suppresses create/stale/parent-move
-     proposals that depend on that certainty.
-- Test suite on this branch: **117 passed**, fixture-based, no network required.
+     proposals that depend on that certainty. Unresolved parent also suppresses
+     `update_fields` on matched accounts: no reparent, no CHOW, and no
+     independently approvable field write until the Bellhaven parent is known.
+     A resolved correct parent still emits normal `update_fields`.
+- Test suite on this branch: **119 passed**, fixture-based, no network required.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
 - Next after a clean merge of PR #3: `feat/apply-and-schedule`.
 

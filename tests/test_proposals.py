@@ -183,6 +183,49 @@ def test_unresolved_parent_suppresses_create_and_parent_moves():
     assert any("parent" in b.lower() for b in batch.blockers)
 
 
+def test_unresolved_parent_suppresses_matched_field_updates():
+    """Ownership is unknown, so a website diff must not become an approvable field write."""
+    facility = _facility(phone="419-555-9999")
+    account = _account(
+        **{
+            fields.PARENT_ID: "WRONG",
+            fields.PHONE: "419-555-0100",
+            fields.LIFETIME_REVENUE: 9000,
+            fields.OUTSTANDING_AR: 300,
+        }
+    )
+    matches = match_facilities([facility], [account])
+    assert matches[0].account is not None
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=matches,
+        parent=_parent(resolved=False),
+        duplicates=[],
+    )
+    assert all(p.action_type != ACTION_UPDATE_FIELDS for p in batch.proposals)
+    assert all(p.action_type != ACTION_REPARENT for p in batch.proposals)
+    assert all(p.action_type != ACTION_CHOW for p in batch.proposals)
+    assert any("parent" in blocker.lower() for blocker in batch.blockers)
+
+
+def test_resolved_correct_parent_still_emits_field_updates():
+    facility = _facility(phone="419-555-9999")
+    account = _account(**{fields.PARENT_ID: "PARENT", fields.PHONE: "419-555-0100"})
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=match_facilities([facility], [account]),
+        parent=_parent(),
+        duplicates=[],
+    )
+    updates = [p for p in batch.proposals if p.action_type == ACTION_UPDATE_FIELDS]
+    assert len(updates) == 1
+    assert updates[0].account_id == account[fields.ACCOUNT_ID]
+    assert updates[0].proposed_values[fields.PHONE] == "419-555-9999"
+    assert all(p.action_type not in {ACTION_REPARENT, ACTION_CHOW} for p in batch.proposals)
+
+
 def test_direct_reparent_proposal():
     facility = _facility()
     account = _account(**{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 100, fields.OUTSTANDING_AR: 0})

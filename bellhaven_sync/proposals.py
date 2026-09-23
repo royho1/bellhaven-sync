@@ -220,10 +220,12 @@ def generate_proposals(
         matched_facility_urls.add(facility.url)
 
         # Parent / CHOW decisions only when we know the correct Bellhaven parent.
-        # Unresolved ownership and confirmed two-step CHOW both forbid any other
-        # old-account field writes. A later human decision may still require CHOW,
-        # and an independently approved field update would violate that invariant.
-        suppress_old_account_field_updates = False
+        # Until that parent is known, or while ownership is unresolved / two-step
+        # CHOW, the old account must not receive an independently approvable field
+        # update. A later parent may require CHOW, and that write surface is only
+        # chow_current_account. Direct re-parent (parent known, no CHOW) may still
+        # update fields.
+        suppress_old_account_field_updates = not parent_ok
         current_parent = str(account.get(fields.PARENT_ID) or "")
         if parent_ok and parent.account_id and current_parent != parent.account_id:
             decision = chow.decide_parent_change(account, target_parent_id=parent.account_id)
