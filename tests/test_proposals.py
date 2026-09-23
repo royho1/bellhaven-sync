@@ -71,6 +71,37 @@ def _parent(resolved=True) -> ParentResolution:
     return ParentResolution(account_id=None, candidates=[], blocker="No Bellhaven parent account found.")
 
 
+def test_formatting_only_unit_difference_is_not_a_street_update():
+    facility = _facility(street="100 Main St Suite 200")
+    account = _account(**{fields.STREET: "100 Main Street Ste. 200"})
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=match_facilities([facility], [account]),
+        parent=_parent(),
+        duplicates=[],
+    )
+    assert all(p.action_type != ACTION_UPDATE_FIELDS for p in batch.proposals)
+
+
+def test_different_unit_identifier_proposes_street_update():
+    facility = _facility(street="100 Main St Suite 200")
+    account = _account(**{fields.STREET: "100 Main St Suite 100"})
+    matches = match_facilities([facility], [account])
+    assert matches[0].account is not None
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=matches,
+        parent=_parent(),
+        duplicates=[],
+    )
+    updates = [p for p in batch.proposals if p.action_type == ACTION_UPDATE_FIELDS]
+    assert len(updates) == 1
+    assert updates[0].current_values[fields.STREET] == "100 Main St Suite 100"
+    assert updates[0].proposed_values[fields.STREET] == "100 Main St Suite 200"
+
+
 def test_matched_field_difference_creates_update_proposal():
     facility = _facility(street="100 Main St", phone="419-555-9999")
     account = _account(phone="419-555-0100")

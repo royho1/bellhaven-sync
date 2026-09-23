@@ -61,6 +61,20 @@ UNIT_WORD_RE = re.compile(
 )
 # "#2" / " # 2" cannot use \b before "#", so handle the hash form separately.
 UNIT_HASH_RE = re.compile(r"#\s*[a-z0-9-]+\b", re.IGNORECASE)
+# Same shapes, but captured so field comparison can keep the unit id.
+UNIT_WORD_CAPTURE_RE = re.compile(
+    r"\b(apartment|suite|unit|apt|ste)\.?\s+([a-z0-9-]+)\b",
+    re.IGNORECASE,
+)
+UNIT_HASH_CAPTURE_RE = re.compile(r"#\s*([a-z0-9-]+)\b", re.IGNORECASE)
+# Abbreviation families only. "#" is the hash spelling of "unit".
+UNIT_DESIGNATOR_CANON = {
+    "apartment": "apt",
+    "apt": "apt",
+    "suite": "ste",
+    "ste": "ste",
+    "unit": "unit",
+}
 PAREN_RE = re.compile(r"\([^)]*\)")
 NON_ALNUM_RE = re.compile(r"[^a-z0-9\s]")
 MULTI_SPACE_RE = re.compile(r"\s+")
@@ -147,13 +161,11 @@ def normalize_zip(value: str | None) -> str:
     return digits[:5]
 
 
-def normalize_street(value: str | None) -> tuple[str, str]:
-    """Return (house_number, normalized_street_without_house_number)."""
-    if not value:
-        return "", ""
-    text = value.lower().strip()
-    text = UNIT_WORD_RE.sub(" ", text)
-    text = UNIT_HASH_RE.sub(" ", text)
+def _finish_street(text: str) -> tuple[str, str]:
+    """Punctuation, house number, and suffix/direction abbreviations.
+
+    Callers decide what to do with suite/unit text before this step.
+    """
     text = NON_ALNUM_RE.sub(" ", text)
     text = _collapse(text)
 
@@ -176,6 +188,48 @@ def normalize_street(value: str | None) -> tuple[str, str]:
         else:
             tokens.append(token)
     return house, _collapse(" ".join(tokens))
+
+
+def _canonicalize_unit_designators(text: str) -> str:
+    """Fold equivalent unit words and keep the identifier."""
+
+    def repl_word(match: re.Match[str]) -> str:
+        kind = match.group(1).lower()
+        ident = match.group(2).lower()
+        return f" {UNIT_DESIGNATOR_CANON[kind]} {ident} "
+
+    def repl_hash(match: re.Match[str]) -> str:
+        return f" unit {match.group(1).lower()} "
+
+    text = UNIT_WORD_CAPTURE_RE.sub(repl_word, text)
+    return UNIT_HASH_CAPTURE_RE.sub(repl_hash, text)
+
+
+def normalize_street(value: str | None) -> tuple[str, str]:
+    """Return (house_number, normalized_street_without_house_number).
+
+    Suite and unit identifiers are removed. Matching uses this so formatting
+    of a suite does not block a facility/account match.
+    """
+    if not value:
+        return "", ""
+    text = value.lower().strip()
+    text = UNIT_WORD_RE.sub(" ", text)
+    text = UNIT_HASH_RE.sub(" ", text)
+    return _finish_street(text)
+
+
+def normalize_street_for_comparison(value: str | None) -> tuple[str, str]:
+    """Like ``normalize_street``, but keep a canonical unit identifier.
+
+    Field diffs use this. ``Suite``/``Ste.`` and ``Apt.``/``Apartment`` compare
+    equal, and ``#2`` compares equal to ``Unit 2``. ``Suite 200`` does not
+    compare equal to ``Suite 100``. Matching must keep using ``normalize_street``.
+    """
+    if not value:
+        return "", ""
+    text = _canonicalize_unit_designators(value.lower().strip())
+    return _finish_street(text)
 
 
 def normalize_location(

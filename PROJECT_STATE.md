@@ -132,7 +132,11 @@ Four branches, each reviewed and merged before the next starts:
      The proposal records the inactive status and match evidence and does not
      set status to Active. Ordinary field diffs may still be proposed when
      existing safety rules allow them. No automatic reactivation.
-- Test suite on this branch: **122 passed**, fixture-based, no network required.
+  12. `normalize_street()` still drops suite/unit identifiers for matching.
+     Proposal field comparison uses `normalize_street_for_comparison()`, which
+     canonicalizes unit designators (`Suite`/`Ste.`, `Apartment`/`Apt.`, `#`/`Unit`)
+     and keeps the unit identifier, so `Suite 200` and `Suite 100` differ.
+- Test suite on this branch: **126 passed**, fixture-based, no network required.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
 - Next after a clean merge of PR #3: `feat/apply-and-schedule`.
 

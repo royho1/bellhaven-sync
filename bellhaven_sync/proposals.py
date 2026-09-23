@@ -13,7 +13,7 @@ from typing import Any
 
 from . import chow, fields
 from .matching import DuplicateGroup, MatchResult, ParentResolution
-from .normalize import normalize_name, normalize_street, normalize_zip
+from .normalize import normalize_name, normalize_street_for_comparison, normalize_zip
 from .scraper import Facility, ScrapeResult
 
 ACTION_UPDATE_FIELDS = "update_fields"
@@ -114,7 +114,7 @@ def _normalized_equal(field_name: str, left: Any, right: Any) -> bool:
     if field_name == fields.NAME:
         return normalize_name(left) == normalize_name(right)
     if field_name == fields.STREET:
-        return normalize_street(left) == normalize_street(right)
+        return normalize_street_for_comparison(left) == normalize_street_for_comparison(right)
     if field_name == fields.ZIP:
         return normalize_zip(left) == normalize_zip(right)
     if field_name == fields.STATE:
