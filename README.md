@@ -9,9 +9,9 @@ read-only by construction: it cannot reach a write method.
 
 ## Status
 
-Phase 0 (`feat/schema-discovery`) is merged. Branch 2 adds the scraper, name/address
-normalization, the state-gated tiered matcher, duplicate detection, and the Bellhaven
-parent resolver. Proposal storage and the review app land next.
+Phases 0-2 are merged (`schema-discovery`, `scrape-and-match`). Branch 3 adds
+proposal generation, SQLite persistence, `sync`, and a local Flask review UI.
+**Branch 3 performs no CRM writes.** Applying approved proposals is Branch 4.
 
 ## Setup
 
@@ -35,7 +35,22 @@ that could carry it passes through `redact()` first.
 # Read-only: scrape Bellhaven's public site (listing + sitemap + facility pages).
 # Raises a completeness blocker when the union is short of the homepage claim.
 .venv/bin/python -m bellhaven_sync.cli scrape
+
+# Read-only: scrape + CRM GET + match + generate proposals into SQLite.
+# Never POSTs or PATCHes the CRM.
+.venv/bin/python -m bellhaven_sync.cli sync
+
+# Local review UI. Approve/reject updates SQLite only; never calls the CRM.
+.venv/bin/python -m bellhaven_sync.cli serve
 ```
+
+## Proposal / review workflow
+
+1. Run `sync` to scrape the site, read CRM accounts, match, and persist proposals
+   under `data/bellhaven_sync.db`.
+2. Run `serve` and open `http://127.0.0.1:5055`.
+3. Filter by status / action type, then Approve or Reject.
+4. Decisions stay in SQLite. Branch 4 will apply only approved items.
 
 ## Tests
 
@@ -52,8 +67,9 @@ implements `get`.
 - All POST and PATCH capability will live in `bellhaven_sync/apply.py`, which the
   sync path never imports. `tests/test_write_boundary.py` walks the transitive import
   graph and fails if that ever changes.
-- The CHOW rule (change of ownership) is isolated in its own module so it can be read
+- The CHOW rule (change of ownership) is isolated in `chow.py` so it can be read
   and verified in one screen.
+- Branch 3 (`sync` / `serve` / proposals / store / review UI) never writes to the CRM.
 
 ## Docs
 

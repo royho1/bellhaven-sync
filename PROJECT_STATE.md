@@ -93,22 +93,22 @@ Four branches, each reviewed and merged before the next starts:
 ## Current status (2026-09-22)
 
 - Branch 1 `feat/schema-discovery` is merged to `main`.
-- Branch 2 `feat/scrape-and-match` is open as [PR #2](https://github.com/royho1/bellhaven-sync/pull/2).
-  **Do not merge until Codex is clean on the latest commit (no P1/P2).**
-- Latest Branch 2 fixes:
-  1. Unit designators require a whole-word match and a real separator before the
-     unit id, so street names like Stevens/Steele are not stripped as "Ste".
-  2. Match edge costs are lexicographic tuples `(tier, similarity_penalty,
-     facility_idx, account_rank)` so deterministic index tie-breaks can never
-     outweigh a better name similarity (or tier).
-  3. Prior: max-cardinality min-cost global assignment with intrinsic ambiguity
-     preserved; listing HTML reused during enrichment; house-number-required
-     usable location; punctuated unit stripping; urls-only never complete.
-- Test suite on this branch: **90 passed**, fixture-based, no network required for
-  scraper/matcher tests.
-- Live site `bellhavenseniorliving.com` still NXDOMAIN; do not treat a failed live
-  scrape as a product bug.
-- Next after a clean merge of PR #2: `feat/proposals-and-review`.
+- Branch 2 `feat/scrape-and-match` is merged to `main` via PR #2 (`4cf89e7`).
+- Branch 3 `feat/proposals-and-review` is in progress as PR #3.
+  **Do not merge until Codex is clean. Do not start Branch 4 yet.**
+- Branch 3 decisions:
+  1. Explicit proposal action types in `proposals.py` (update/reparent/CHOW/create/
+     ambiguous/duplicate/stale/chow-review). No invented merge/delete/deactivate.
+  2. `chow.py` isolates parent-change policy; zero revenue + positive AR is human
+     review; revenue+AR uses two-step CHOW plan; otherwise direct re-parent.
+  3. SQLite `data/bellhaven_sync.db` stores runs + proposals; new runs insert rows
+     and never overwrite prior review status.
+  4. `cli sync` and `cli serve` are CRM-read-only; approve/reject only updates SQLite.
+  5. Incomplete scrape or unresolved parent suppresses create/stale/parent-move
+     proposals that depend on that certainty.
+- Test suite on this branch: **109 passed**, fixture-based, no network required.
+- Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
+- Next after a clean merge of PR #3: `feat/apply-and-schedule`.
 
 ## Open questions
 
