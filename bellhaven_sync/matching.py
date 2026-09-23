@@ -155,22 +155,167 @@ def _confidence_for_tier(tier: int) -> str:
     return "none"
 
 
+def _is_intrinsically_ambiguous(
+    candidates: list[MatchCandidate],
+) -> tuple[bool, list[MatchCandidate]]:
+    """Ambiguity is evaluated on the facility's full candidate list.
+
+    Consuming one candidate elsewhere must not quietly resolve the ambiguity.
+    """
+    if len(candidates) < 2:
+        return False, []
+    best, second = candidates[0], candidates[1]
+    same_tier = second.tier == best.tier
+    thin_margin = abs(best.name_similarity - second.name_similarity) < AMBIGUITY_MARGIN
+    if same_tier or thin_margin:
+        return True, candidates[1:4]
+    return False, []
+
+
+def _edge_cost(candidate: MatchCandidate, facility_idx: int, account_rank: int) -> int:
+    """Lower is better: tier first, then higher name similarity, then stable ids."""
+    return (
+        candidate.tier * 1_000_000_000
+        + int(round((1.0 - candidate.name_similarity) * 1_000_000))
+        + facility_idx * 1_000
+        + account_rank
+    )
+
+
+def _min_cost_max_matching(
+    facility_indices: list[int],
+    candidates_by_idx: dict[int, list[MatchCandidate]],
+) -> dict[int, MatchCandidate]:
+    """Max-cardinality bipartite matching with min total edge cost.
+
+    Successive shortest augmenting paths. Prefer more matches first, then lower
+    tiers / higher similarities via edge costs. Deterministic.
+    """
+    f_list = sorted(facility_indices)
+    if not f_list:
+        return {}
+
+    account_ids = sorted(
+        {c.account_id for fi in f_list for c in candidates_by_idx.get(fi, [])}
+    )
+    if not account_ids:
+        return {}
+
+    a_rank = {aid: i for i, aid in enumerate(account_ids)}
+    edges: dict[tuple[int, str], tuple[int, MatchCandidate]] = {}
+    for fi in f_list:
+        for candidate in candidates_by_idx[fi]:
+            edges[(fi, candidate.account_id)] = (
+                _edge_cost(candidate, fi, a_rank[candidate.account_id]),
+                candidate,
+            )
+
+    match_fac: dict[int, str] = {}
+    match_acc: dict[str, int] = {}
+    chosen: dict[int, MatchCandidate] = {}
+    inf = 10**18
+
+    def augment() -> bool:
+        dist_f = {fi: inf for fi in f_list}
+        dist_a = {aid: inf for aid in account_ids}
+        parent_a: dict[str, int] = {}
+        parent_f: dict[int, str] = {}
+        queue: list[tuple[str, int | str]] = []
+        in_f: set[int] = set()
+        in_a: set[str] = set()
+
+        for fi in f_list:
+            if fi not in match_fac:
+                dist_f[fi] = 0
+                queue.append(("f", fi))
+                in_f.add(fi)
+
+        best_free_acc: str | None = None
+        best_free_dist = inf
+
+        while queue:
+            kind, node = queue.pop(0)
+            if kind == "f":
+                fi = int(node)
+                in_f.discard(fi)
+                for aid in account_ids:
+                    key = (fi, aid)
+                    if key not in edges:
+                        continue
+                    if match_fac.get(fi) == aid:
+                        continue
+                    cost, _ = edges[key]
+                    nd = dist_f[fi] + cost
+                    if nd < dist_a[aid]:
+                        dist_a[aid] = nd
+                        parent_a[aid] = fi
+                        if aid not in match_acc and (
+                            nd < best_free_dist
+                            or (
+                                nd == best_free_dist
+                                and (best_free_acc is None or aid < best_free_acc)
+                            )
+                        ):
+                            best_free_dist = nd
+                            best_free_acc = aid
+                        if aid not in in_a:
+                            queue.append(("a", aid))
+                            in_a.add(aid)
+            else:
+                aid = str(node)
+                in_a.discard(aid)
+                if aid not in match_acc:
+                    continue
+                fi = match_acc[aid]
+                cost, _ = edges[(fi, aid)]
+                nd = dist_a[aid] - cost
+                if nd < dist_f[fi]:
+                    dist_f[fi] = nd
+                    parent_f[fi] = aid
+                    if fi not in in_f:
+                        queue.append(("f", fi))
+                        in_f.add(fi)
+
+        if best_free_acc is None:
+            return False
+
+        aid: str | None = best_free_acc
+        while aid is not None:
+            fi = parent_a[aid]
+            prior = match_fac.get(fi)
+            match_fac[fi] = aid
+            match_acc[aid] = fi
+            chosen[fi] = edges[(fi, aid)][1]
+            if prior is not None and match_acc.get(prior) == fi:
+                del match_acc[prior]
+            if fi not in parent_f:
+                break
+            aid = parent_f[fi]
+        return True
+
+    while augment():
+        pass
+
+    return chosen
+
+
 def match_facilities(
     facilities: Iterable[Facility],
     accounts: Iterable[dict[str, Any]],
 ) -> list[MatchResult]:
-    """Greedy one-to-one assignment by best currently available candidate.
+    """One-to-one assignment that protects scarce accounts and ambiguity.
 
-    Priority is recomputed after every assignment. A facility whose initial
-    best account was taken must not keep that stale tier and steal a weaker
-    fallback from another facility with a stronger live claim.
+    1. Facilities that are intrinsically ambiguous on their full candidate list
+       become human-review items and never receive an automatic account.
+    2. Remaining facilities are assigned with a max-cardinality, min-cost
+       bipartite matching so a facility with alternatives does not consume the
+       only account another facility can use.
     """
     facility_list = list(facilities)
     account_list = list(accounts)
     account_norms = {a.get(fields.ACCOUNT_ID): account_location(a) for a in account_list}
     accounts_by_id = {a.get(fields.ACCOUNT_ID): a for a in account_list}
 
-    # Precompute all viable candidates per facility.
     per_facility: list[tuple[Facility, NormalizedLocation, list[MatchCandidate]]] = []
     for facility in facility_list:
         fnorm = facility_location(facility)
@@ -191,52 +336,17 @@ def match_facilities(
         candidates.sort(key=lambda c: (c.tier, -c.name_similarity, c.account_id))
         per_facility.append((facility, fnorm, candidates))
 
-    remaining = {idx for idx, (_, _, cands) in enumerate(per_facility) if cands}
-    used_accounts: set[str] = set()
-    used_facilities: set[int] = set()
     assigned: dict[int, MatchResult] = {}
+    assignable: list[int] = []
+    candidates_by_idx: dict[int, list[MatchCandidate]] = {}
 
-    while remaining:
-        best_key: tuple[int, float, int, str] | None = None
-        best_idx: int | None = None
-        best_available: list[MatchCandidate] = []
-        exhausted: list[int] = []
-
-        for idx in remaining:
-            _, _, candidates = per_facility[idx]
-            available = [c for c in candidates if c.account_id not in used_accounts]
-            if not available:
-                exhausted.append(idx)
-                continue
-            top = available[0]
-            # Deterministic: tier, then higher name similarity, then facility
-            # index, then account id so equal claims resolve stably.
-            key = (top.tier, -top.name_similarity, idx, top.account_id)
-            if best_key is None or key < best_key:
-                best_key = key
-                best_idx = idx
-                best_available = available
-
-        for idx in exhausted:
-            remaining.discard(idx)
-
-        if best_idx is None:
-            break
-
-        facility, fnorm, _ = per_facility[best_idx]
-        best = best_available[0]
-        ambiguous = False
-        runners: list[MatchCandidate] = []
-        if len(best_available) > 1:
-            second = best_available[1]
-            same_tier = second.tier == best.tier
-            thin_margin = abs(best.name_similarity - second.name_similarity) < AMBIGUITY_MARGIN
-            if same_tier or thin_margin:
-                ambiguous = True
-                runners = best_available[1:4]
-
+    for idx, (facility, fnorm, candidates) in enumerate(per_facility):
+        if not candidates:
+            continue
+        ambiguous, runners = _is_intrinsically_ambiguous(candidates)
         if ambiguous:
-            assigned[best_idx] = MatchResult(
+            best = candidates[0]
+            assigned[idx] = MatchResult(
                 facility=facility,
                 facility_norm=fnorm,
                 account=None,
@@ -247,24 +357,24 @@ def match_facilities(
                 ambiguous=True,
                 runners_up=[best, *runners],
             )
-            used_facilities.add(best_idx)
-            remaining.discard(best_idx)
             continue
+        assignable.append(idx)
+        candidates_by_idx[idx] = candidates
 
-        account = accounts_by_id[best.account_id]
-        assigned[best_idx] = MatchResult(
+    chosen = _min_cost_max_matching(assignable, candidates_by_idx)
+    for idx, candidate in chosen.items():
+        facility, fnorm, _ = per_facility[idx]
+        account = accounts_by_id[candidate.account_id]
+        assigned[idx] = MatchResult(
             facility=facility,
             facility_norm=fnorm,
             account=account,
-            account_norm=account_norms[best.account_id],
-            tier=best.tier,
-            confidence=_confidence_for_tier(best.tier),
-            name_similarity=best.name_similarity,
-            reasons=list(best.reasons),
+            account_norm=account_norms[candidate.account_id],
+            tier=candidate.tier,
+            confidence=_confidence_for_tier(candidate.tier),
+            name_similarity=candidate.name_similarity,
+            reasons=list(candidate.reasons),
         )
-        used_accounts.add(best.account_id)
-        used_facilities.add(best_idx)
-        remaining.discard(best_idx)
 
     results: list[MatchResult] = []
     for idx, (facility, fnorm, _) in enumerate(per_facility):

@@ -96,15 +96,20 @@ Four branches, each reviewed and merged before the next starts:
 - Branch 2 `feat/scrape-and-match` is open as [PR #2](https://github.com/royho1/bellhaven-sync/pull/2).
   **Do not merge until Codex is clean on the latest commit (no P1/P2).**
 - Latest Branch 2 fixes:
-  1. `has_usable_location()` requires state, street, and a nonempty normalized house
-     number (via `normalize_street`), so PO boxes / non-numbered streets cannot mark
-     a scrape reconciliation-complete.
-  2. Unit stripping accepts an optional period after designators (`Apt.`, `Ste.`,
-     `Suite.`) so punctuated units do not leak into normalized streets.
-  3. Prior: location-less pages are enrichment failures; public scrape uses
-     `load_local_paths()` without CRM token; matching re-ranks live candidates;
-     urls-only never complete; filler phrases share the name punctuation pipeline.
-- Test suite on this branch: **83 passed**, fixture-based, no network required for
+  1. Matching uses max-cardinality min-cost bipartite assignment (successive
+     shortest augmenting paths) so a facility with alternatives does not consume
+     a scarce account another facility needs. Intrinsic ambiguity is decided on
+     each facility's full candidate list before assignment, so other matches
+     cannot quietly resolve human-review cases.
+  2. Scraper retains successfully fetched listing-facility HTML during the
+     internal-link discovery pass and reuses it during enrichment, avoiding
+     redundant requests and false enrichment failures when a second fetch would
+     flake.
+  3. Prior: house-number-required usable location; punctuated unit stripping;
+     location-less pages are enrichment failures; public scrape uses
+     `load_local_paths()` without CRM token; urls-only never complete; filler
+     phrases share the name punctuation pipeline.
+- Test suite on this branch: **86 passed**, fixture-based, no network required for
   scraper/matcher tests.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; do not treat a failed live
   scrape as a product bug.

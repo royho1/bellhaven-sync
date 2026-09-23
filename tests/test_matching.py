@@ -197,7 +197,7 @@ def test_ambiguity_margin_produces_review_item_not_action():
     assert len(results[0].runners_up) >= 2
 
 
-def test_greedy_assignment_is_one_to_one():
+def test_assignment_is_one_to_one():
     f1 = _facility(
         name="Alpha",
         street="1 Oak St",
@@ -228,6 +228,127 @@ def test_greedy_assignment_is_one_to_one():
     results = match_facilities([f1, f2], [account])
     matched = [r for r in results if r.account is not None]
     assert len(matched) == 1
+    used_ids = [r.account[fields.ACCOUNT_ID] for r in matched]
+    assert used_ids == ["ONLY"]
+
+
+def test_scarce_account_prefers_global_cardinality():
+    """Facility with an alternative must not consume a scarce account.
+
+    F1 can take A at tier 1 or B at tier 2. F2 can take only A at tier 1.
+    Greedy F1→A leaves F2 unmatched; global assignment yields F2→A and F1→B.
+    """
+    account_a = _account(
+        **{
+            fields.ACCOUNT_ID: "A",
+            fields.NAME: "Alpha Oaks",
+            fields.STREET: "100 Oak Street",
+            fields.CITY: "Akron",
+            fields.STATE: "OH",
+            fields.ZIP: "44301",
+        }
+    )
+    # Distinct name so F1's tier-1 vs tier-2 pair is not thin-margin ambiguous.
+    account_b = _account(
+        **{
+            fields.ACCOUNT_ID: "B",
+            fields.NAME: "Maple Ridge Manor",
+            fields.STREET: "100 Oak Street",
+            fields.CITY: "Akron",
+            fields.STATE: "OH",
+            fields.ZIP: "44302",
+        }
+    )
+    # Same street+ZIP as A (tier 1); same street+city as B with ZIP mismatch (tier 2).
+    f1 = _facility(
+        name="Alpha Oaks",
+        street="100 Oak St",
+        city="Akron",
+        state="OH",
+        zip="44301",
+        url="https://example.test/f1",
+    )
+    # Same street+ZIP as A (tier 1). Different city from B so tier 2 does not fire.
+    f2 = _facility(
+        name="Dayton Alpha",
+        street="100 Oak St",
+        city="Dayton",
+        state="OH",
+        zip="44301",
+        url="https://example.test/f2",
+    )
+
+    results = {
+        r.facility.url: r for r in match_facilities([f1, f2], [account_a, account_b])
+    }
+
+    assert results["https://example.test/f2"].account[fields.ACCOUNT_ID] == "A"
+    assert results["https://example.test/f2"].tier == TIER_STREET_ZIP
+    assert results["https://example.test/f1"].account[fields.ACCOUNT_ID] == "B"
+    assert results["https://example.test/f1"].tier == 2
+    matched = [r for r in results.values() if r.account is not None]
+    assert len(matched) == 2
+    assert {r.account[fields.ACCOUNT_ID] for r in matched} == {"A", "B"}
+
+
+def test_intrinsic_ambiguity_not_resolved_by_other_assignments():
+    """Ambiguity is fixed from the full candidate list, not leftover accounts.
+
+    F scores A at tier 1 and B at tier 2 with nearly identical name similarity,
+    so it is intrinsically ambiguous. G has a unique tier-1 claim on A only.
+    Consuming A for G must not auto-assign F to B.
+    """
+    account_a = _account(
+        **{
+            fields.ACCOUNT_ID: "A",
+            fields.NAME: "Alpha Oaks",
+            fields.STREET: "100 Oak Street",
+            fields.CITY: "Akron",
+            fields.STATE: "OH",
+            fields.ZIP: "44301",
+        }
+    )
+    account_b = _account(
+        **{
+            fields.ACCOUNT_ID: "B",
+            fields.NAME: "Alpha Oaks",
+            fields.STREET: "100 Oak Street",
+            fields.CITY: "Akron",
+            fields.STATE: "OH",
+            fields.ZIP: "44302",
+        }
+    )
+    ambiguous = _facility(
+        name="Alpha Oaks",
+        street="100 Oak St",
+        city="Akron",
+        state="OH",
+        zip="44301",
+        url="https://example.test/amb",
+    )
+    # Same street+ZIP as A (tier 1). Different city from B so B is not a candidate.
+    other = _facility(
+        name="Dayton Alpha Oaks",
+        street="100 Oak St",
+        city="Dayton",
+        state="OH",
+        zip="44301",
+        url="https://example.test/other",
+    )
+
+    results = {
+        r.facility.url: r
+        for r in match_facilities([ambiguous, other], [account_a, account_b])
+    }
+    assert results["https://example.test/amb"].ambiguous is True
+    assert results["https://example.test/amb"].account is None
+    assert results["https://example.test/amb"].confidence == "ambiguous"
+    assert results["https://example.test/other"].account[fields.ACCOUNT_ID] == "A"
+    # B remains unused; the optimizer must not "solve" ambiguity by assigning it.
+    assert results["https://example.test/amb"].account is None
+    assert all(
+        r.account is None or r.account[fields.ACCOUNT_ID] != "B" for r in results.values()
+    )
 
 
 def test_duplicate_grouping_by_street_zip():

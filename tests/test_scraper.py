@@ -278,3 +278,48 @@ def test_missing_claimed_count_is_a_completeness_blocker():
 def test_claimed_count_parser():
     html = (FIXTURES / "homepage.html").read_text(encoding="utf-8")
     assert scraper.parse_claimed_count(html) == 35
+
+
+def test_enrichment_reuses_html_fetched_during_discovery():
+    """Listing pages fetched for internal-link discovery must not be re-fetched.
+
+    A second call for the same listing URL that raises must not turn a previously
+    successful discovery fetch into an enrichment failure.
+    """
+    homepage = (FIXTURES / "homepage.html").read_text(encoding="utf-8").replace(
+        "35 communities", "5 communities"
+    )
+    base_fetch = fixture_fetcher({f"{BASE}/": homepage})
+    counts: dict[str, int] = {}
+
+    def counting_then_fail(url: str) -> str:
+        counts[url] = counts.get(url, 0) + 1
+        # After the first successful response for a facility page, fail on any
+        # further request for that URL. Reuse must prevent the second call.
+        if counts[url] > 1 and "/communities/" in url:
+            raise RuntimeError(f"redundant fetch for {url}")
+        return base_fetch(url)
+
+    result = scraper.scrape_bellhaven(
+        base_url=BASE, fetch=counting_then_fail, enrich_pages=True
+    )
+
+    listing_urls = {
+        f"{BASE}/communities/bellhaven-of-new-carlisle",
+        f"{BASE}/communities/bellhaven-court-of-altoona",
+        f"{BASE}/communities/bellhaven-crossings-of-lima",
+        f"{BASE}/communities/bellhaven-of-tiffin",
+    }
+    for url in listing_urls:
+        assert counts.get(url) == 1, f"{url} fetched {counts.get(url)} times"
+        facility = next(f for f in result.facilities if f.url == url)
+        assert scraper.has_usable_location(facility)
+
+    # Sitemap-only Findlay was not in the listing discovery walk; fetch once now.
+    findlay = f"{BASE}/communities/bellhaven-meadows-of-findlay"
+    assert counts.get(findlay) == 1
+    assert scraper.has_usable_location(next(f for f in result.facilities if f.url == findlay))
+
+    assert result.complete is True
+    assert result.blockers == []
+    assert not any("enrichment failed" in b.lower() for b in result.blockers)

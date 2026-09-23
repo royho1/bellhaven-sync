@@ -372,6 +372,8 @@ def scrape_bellhaven(
                 sources.append(source)
 
     # Walk each listing page once for more internal community links.
+    # Retain successful HTML so enrichment does not re-fetch the same URL.
+    fetched_html: dict[str, str] = {}
     extra_pages = list(listing_links.keys())[:40]
     for page_url in extra_pages:
         try:
@@ -381,6 +383,7 @@ def scrape_bellhaven(
             continue
         if not html:
             continue
+        fetched_html[page_url] = html
         for url, source in parse_community_links(html, base, source="internal").items():
             sources = union.setdefault(url, [])
             if source not in sources:
@@ -391,7 +394,11 @@ def scrape_bellhaven(
     for url, sources in sorted(union.items()):
         if enrich_pages:
             try:
-                html = do_fetch(url)
+                if url in fetched_html:
+                    html = fetched_html[url]
+                else:
+                    html = do_fetch(url)
+                    fetched_html[url] = html
                 facility = parse_facility_page(html, url)
                 if not has_usable_location(facility):
                     house, _ = normalize_street(facility.street)
