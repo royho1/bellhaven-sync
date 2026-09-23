@@ -55,15 +55,16 @@ DIRECTION_ABBREV = {
 
 # Designator must be a whole word, and a real separator must precede the unit
 # id. Zero-width separators would let "ste" eat the start of "Stevens"/"Steele".
+# Optional "#" covers "Suite #200" / "Unit #2" as one unit, not "suite" plus "#200".
 UNIT_WORD_RE = re.compile(
-    r"\b(?:apartment|suite|unit|apt|ste)\.?\s+[a-z0-9-]+\b",
+    r"\b(?:apartment|suite|unit|apt|ste)\.?\s+#?\s*[a-z0-9-]+\b",
     re.IGNORECASE,
 )
 # "#2" / " # 2" cannot use \b before "#", so handle the hash form separately.
 UNIT_HASH_RE = re.compile(r"#\s*[a-z0-9-]+\b", re.IGNORECASE)
 # Same shapes, but captured so field comparison can keep the unit id.
 UNIT_WORD_CAPTURE_RE = re.compile(
-    r"\b(apartment|suite|unit|apt|ste)\.?\s+([a-z0-9-]+)\b",
+    r"\b(apartment|suite|unit|apt|ste)\.?\s+#?\s*([a-z0-9-]+)\b",
     re.IGNORECASE,
 )
 UNIT_HASH_CAPTURE_RE = re.compile(r"#\s*([a-z0-9-]+)\b", re.IGNORECASE)
@@ -139,6 +140,19 @@ def normalize_name(value: str | None) -> str:
     text = _collapse(text)
     tokens = [t for t in text.split() if t not in FILLER_WORDS]
     return _collapse(" ".join(tokens))
+
+
+def normalize_name_for_comparison(value: str | None) -> str:
+    """Formatting-only name comparison for proposal field diffs.
+
+    Matching keeps using lossy ``normalize_name``, which strips care-type
+    phrases and parenthetical text. This helper keeps those words. Parentheses
+    themselves are dropped; the words inside them stay.
+    """
+    if not value:
+        return ""
+    text = value.replace("&", " and ")
+    return _alnum_collapse(text)
 
 
 def normalize_city(value: str | None) -> str:
@@ -222,9 +236,10 @@ def normalize_street(value: str | None) -> tuple[str, str]:
 def normalize_street_for_comparison(value: str | None) -> tuple[str, str]:
     """Like ``normalize_street``, but keep a canonical unit identifier.
 
-    Field diffs use this. ``Suite``/``Ste.`` and ``Apt.``/``Apartment`` compare
-    equal, and ``#2`` compares equal to ``Unit 2``. ``Suite 200`` does not
-    compare equal to ``Suite 100``. Matching must keep using ``normalize_street``.
+    Field diffs use this. ``Suite``/``Ste.``/``Suite #`` and ``Apt.``/``Apartment``
+    compare equal, and ``#2`` compares equal to ``Unit 2`` and ``Unit #2``.
+    ``Suite 200`` does not compare equal to ``Suite 100``. Matching must keep
+    using ``normalize_street``.
     """
     if not value:
         return "", ""

@@ -98,8 +98,8 @@ Four branches, each reviewed and merged before the next starts:
   **Do not merge until Codex is clean. Do not start Branch 4 yet.**
 - Branch 3 decisions:
   1. Explicit proposal action types in `proposals.py` (update/reparent/CHOW/create/
-     ambiguous/duplicate/stale/chow-review/inactive-review). No invented
-     merge/delete/deactivate.
+     ambiguous/duplicate/stale/chow-review/inactive-review/care-type-review).
+     No invented merge/delete/deactivate.
   2. `chow.py` isolates parent-change policy; zero revenue + positive AR is human
      review; revenue+AR uses two-step CHOW plan; otherwise direct re-parent.
   3. Two-step CHOW suppresses `update_fields` on the old account; website values
@@ -134,9 +134,19 @@ Four branches, each reviewed and merged before the next starts:
      existing safety rules allow them. No automatic reactivation.
   12. `normalize_street()` still drops suite/unit identifiers for matching.
      Proposal field comparison uses `normalize_street_for_comparison()`, which
-     canonicalizes unit designators (`Suite`/`Ste.`, `Apartment`/`Apt.`, `#`/`Unit`)
-     and keeps the unit identifier, so `Suite 200` and `Suite 100` differ.
-- Test suite on this branch: **126 passed**, fixture-based, no network required.
+     canonicalizes unit designators (`Suite`/`Ste.`/`Suite #`, `Apartment`/`Apt.`,
+     `#`/`Unit`/`Unit #`) and keeps the unit identifier, so `Suite 200` and
+     `Suite 100` differ. `Suite #200` is the same unit as `Suite 200`.
+  13. Writable `care_type` values stay inside the observed CRM set: Skilled
+     Nursing, Assisted Living, Memory Care, Independent Living. Multiple website
+     offerings, or an unrecognized offering, become `review_care_type` only.
+     They are never joined into a composite, and create/CHOW templates omit
+     `care_type` until there is exactly one supported value. No offering is
+     chosen automatically.
+  14. `normalize_name()` stays lossy for matching. Proposal name comparison uses
+     `normalize_name_for_comparison()`, which keeps qualifiers such as Memory
+     Care, Assisted Living, and parenthetical words.
+- Test suite on this branch: **137 passed**, fixture-based, no network required.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
 - Next after a clean merge of PR #3: `feat/apply-and-schedule`.
 

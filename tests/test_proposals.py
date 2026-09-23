@@ -10,10 +10,12 @@ from bellhaven_sync.proposals import (
     ACTION_REPARENT,
     ACTION_REVIEW_AMBIGUOUS,
     ACTION_REVIEW_CHOW,
+    ACTION_REVIEW_CARE_TYPE,
     ACTION_REVIEW_DUPLICATE,
     ACTION_REVIEW_INACTIVE,
     ACTION_REVIEW_STALE,
     ACTION_UPDATE_FIELDS,
+    SUPPORTED_CARE_TYPES,
     generate_proposals,
 )
 from bellhaven_sync.scraper import Facility, ScrapeResult
@@ -593,3 +595,196 @@ def test_inactive_match_with_field_diff_keeps_both_reviews():
     assert updates[0].proposed_values == {fields.PHONE: "419-555-9999"}
     assert fields.STATUS not in updates[0].proposed_values
     assert all(not _proposes_status(p) for p in batch.proposals)
+
+
+def _writable_care_types(proposal) -> list:
+    found: list = []
+
+    def walk(value) -> None:
+        if isinstance(value, dict):
+            if fields.CARE_TYPE in value:
+                found.append(value[fields.CARE_TYPE])
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(proposal.proposed_values)
+    return found
+
+
+def _assert_care_types_in_domain(batch) -> None:
+    allowed = set(SUPPORTED_CARE_TYPES)
+    for proposal in batch.proposals:
+        for value in _writable_care_types(proposal):
+            assert value in allowed
+            assert "," not in str(value)
+
+
+def test_single_supported_care_type_is_a_normal_field_update():
+    facility = _facility(care_types=["Memory Care"])
+    account = _account(**{fields.CARE_TYPE: "Assisted Living"})
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=match_facilities([facility], [account]),
+        parent=_parent(),
+        duplicates=[],
+    )
+    updates = [p for p in batch.proposals if p.action_type == ACTION_UPDATE_FIELDS]
+    assert len(updates) == 1
+    assert updates[0].proposed_values[fields.CARE_TYPE] == "Memory Care"
+    assert all(p.action_type != ACTION_REVIEW_CARE_TYPE for p in batch.proposals)
+    _assert_care_types_in_domain(batch)
+
+
+def test_multiple_care_offerings_are_not_a_composite_update():
+    offerings = ["Assisted Living", "Memory Care"]
+    facility = _facility(care_types=offerings)
+    account = _account(**{fields.CARE_TYPE: "Skilled Nursing"})
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=match_facilities([facility], [account]),
+        parent=_parent(),
+        duplicates=[],
+    )
+    reviews = [p for p in batch.proposals if p.action_type == ACTION_REVIEW_CARE_TYPE]
+    assert len(reviews) == 1
+    assert reviews[0].evidence["website_care_types"] == offerings
+    assert reviews[0].proposed_values == {}
+    for proposal in batch.proposals:
+        if proposal.action_type == ACTION_UPDATE_FIELDS:
+            assert fields.CARE_TYPE not in proposal.proposed_values
+    _assert_care_types_in_domain(batch)
+
+    already = _account(**{fields.CARE_TYPE: "Assisted Living"})
+    kept = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[already],
+        matches=match_facilities([facility], [already]),
+        parent=_parent(),
+        duplicates=[],
+    )
+    assert any(p.action_type == ACTION_REVIEW_CARE_TYPE for p in kept.proposals)
+    assert all(fields.CARE_TYPE not in p.proposed_values for p in kept.proposals if p.action_type == ACTION_UPDATE_FIELDS)
+    _assert_care_types_in_domain(kept)
+
+
+def test_multiple_care_offerings_are_omitted_from_create_template():
+    offerings = ["Assisted Living", "Memory Care"]
+    facility = _facility(name="Brand New Place", street="9 Pine St", zip="44880", care_types=offerings)
+    parent_acct = _account(**{fields.ACCOUNT_ID: "PARENT", fields.PARENT_ID: ""})
+    batch = generate_proposals(
+        scrape=_scrape([facility], complete=True),
+        accounts=[parent_acct],
+        matches=match_facilities([facility], [parent_acct]),
+        parent=_parent(),
+        duplicates=[],
+    )
+    creates = [p for p in batch.proposals if p.action_type == ACTION_CREATE_ACCOUNT]
+    reviews = [p for p in batch.proposals if p.action_type == ACTION_REVIEW_CARE_TYPE]
+    assert len(creates) == 1
+    assert fields.CARE_TYPE not in creates[0].proposed_values
+    assert creates[0].evidence["website_care_types"] == offerings
+    assert len(reviews) == 1
+    assert reviews[0].evidence["website_care_types"] == offerings
+    assert reviews[0].proposed_values == {}
+    _assert_care_types_in_domain(batch)
+
+
+def test_multiple_care_offerings_are_omitted_from_chow_template():
+    offerings = ["Assisted Living", "Memory Care"]
+    facility = _facility(care_types=offerings)
+    account = _account(
+        **{
+            fields.PARENT_ID: "WRONG",
+            fields.LIFETIME_REVENUE: 9000,
+            fields.OUTSTANDING_AR: 300,
+            fields.CARE_TYPE: "Skilled Nursing",
+        }
+    )
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=match_facilities([facility], [account]),
+        parent=_parent(),
+        duplicates=[],
+    )
+    chows = [p for p in batch.proposals if p.action_type == ACTION_CHOW]
+    reviews = [p for p in batch.proposals if p.action_type == ACTION_REVIEW_CARE_TYPE]
+    assert len(chows) == 1
+    template = chows[0].proposed_values["new_account_template"]
+    assert fields.CARE_TYPE not in template
+    assert chows[0].evidence["website_care_types"] == offerings
+    assert len(reviews) == 1
+    assert reviews[0].evidence["website_care_types"] == offerings
+    _assert_care_types_in_domain(batch)
+
+
+def test_unsupported_care_type_is_review_only():
+    facility = _facility(care_types=["Rehabilitation"])
+    account = _account(**{fields.CARE_TYPE: "Assisted Living"})
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=match_facilities([facility], [account]),
+        parent=_parent(),
+        duplicates=[],
+    )
+    reviews = [p for p in batch.proposals if p.action_type == ACTION_REVIEW_CARE_TYPE]
+    assert len(reviews) == 1
+    assert reviews[0].evidence["website_care_types"] == ["Rehabilitation"]
+    assert reviews[0].proposed_values == {}
+    assert all("Rehabilitation" not in _writable_care_types(p) for p in batch.proposals)
+    _assert_care_types_in_domain(batch)
+
+
+def test_memory_care_versus_assisted_living_name_is_a_field_diff():
+    facility = _facility(name="Bellhaven Memory Care of Tiffin")
+    account = _account(**{fields.NAME: "Bellhaven Assisted Living of Tiffin"})
+    matches = match_facilities([facility], [account])
+    assert matches[0].account is not None
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=matches,
+        parent=_parent(),
+        duplicates=[],
+    )
+    updates = [p for p in batch.proposals if p.action_type == ACTION_UPDATE_FIELDS]
+    assert len(updates) == 1
+    assert updates[0].current_values[fields.NAME] == "Bellhaven Assisted Living of Tiffin"
+    assert updates[0].proposed_values[fields.NAME] == "Bellhaven Memory Care of Tiffin"
+
+
+def test_parenthetical_name_qualifier_remains_a_field_diff():
+    facility = _facility(name="Bellhaven of Tiffin (Memory Care)")
+    account = _account(**{fields.NAME: "Bellhaven of Tiffin (Assisted Living)"})
+    matches = match_facilities([facility], [account])
+    assert matches[0].account is not None
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=matches,
+        parent=_parent(),
+        duplicates=[],
+    )
+    updates = [p for p in batch.proposals if p.action_type == ACTION_UPDATE_FIELDS]
+    assert len(updates) == 1
+    assert updates[0].proposed_values[fields.NAME] == "Bellhaven of Tiffin (Memory Care)"
+
+
+def test_name_formatting_alone_does_not_update():
+    facility = _facility(name="Bellhaven   of   Tiffin")
+    account = _account(**{fields.NAME: "Bellhaven of Tiffin"})
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=match_facilities([facility], [account]),
+        parent=_parent(),
+        duplicates=[],
+    )
+    assert all(fields.NAME not in p.proposed_values for p in batch.proposals if p.action_type == ACTION_UPDATE_FIELDS)
+    assert all(p.action_type != ACTION_UPDATE_FIELDS for p in batch.proposals)

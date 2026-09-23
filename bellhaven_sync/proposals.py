@@ -13,7 +13,7 @@ from typing import Any
 
 from . import chow, fields
 from .matching import DuplicateGroup, MatchResult, ParentResolution
-from .normalize import normalize_name, normalize_street_for_comparison, normalize_zip
+from .normalize import normalize_name_for_comparison, normalize_street_for_comparison, normalize_zip
 from .scraper import Facility, ScrapeResult
 
 ACTION_UPDATE_FIELDS = "update_fields"
@@ -25,6 +25,16 @@ ACTION_REVIEW_DUPLICATE = "review_duplicate"
 ACTION_REVIEW_STALE = "review_stale_or_missing"
 ACTION_REVIEW_CHOW = "review_chow_ambiguous"
 ACTION_REVIEW_INACTIVE = "review_inactive_account"
+ACTION_REVIEW_CARE_TYPE = "review_care_type"
+
+# Observed CRM care_type domain. Unset is the empty string, not a writable value.
+SUPPORTED_CARE_TYPES = (
+    "Skilled Nursing",
+    "Assisted Living",
+    "Memory Care",
+    "Independent Living",
+)
+_SUPPORTED_CARE_BY_KEY = {name.casefold(): name for name in SUPPORTED_CARE_TYPES}
 
 STATUS_PENDING = "pending"
 STATUS_APPROVED = "approved"
@@ -90,20 +100,52 @@ def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _facility_care_type(facility: Facility) -> str:
-    return ", ".join(facility.care_types) if facility.care_types else ""
+def _classify_care_types(offerings: list[str]) -> tuple[list[str], list[str]]:
+    """Split website offerings into canonical CRM values and everything else."""
+    supported: list[str] = []
+    unsupported: list[str] = []
+    seen: set[str] = set()
+    for raw in offerings:
+        text = (raw or "").strip()
+        if not text:
+            continue
+        canonical = _SUPPORTED_CARE_BY_KEY.get(text.casefold())
+        if canonical:
+            if canonical not in seen:
+                supported.append(canonical)
+                seen.add(canonical)
+        else:
+            unsupported.append(text)
+    return supported, unsupported
+
+
+def _safe_writable_care_type(offerings: list[str]) -> str | None:
+    """The one CRM care_type that can be written, or None when a human must choose."""
+    supported, unsupported = _classify_care_types(offerings)
+    if len(supported) == 1 and not unsupported:
+        return supported[0]
+    return None
 
 
 def _website_field_values(facility: Facility) -> dict[str, str]:
-    return {
+    values = {
         fields.NAME: facility.name or "",
         fields.STREET: facility.street or "",
         fields.CITY: facility.city or "",
         fields.STATE: (facility.state or "").upper(),
         fields.ZIP: facility.zip or "",
-        fields.CARE_TYPE: _facility_care_type(facility),
         fields.PHONE: facility.phone or "",
     }
+    care_type = _safe_writable_care_type(facility.care_types)
+    if care_type:
+        values[fields.CARE_TYPE] = care_type
+    return values
+
+
+def _care_type_needs_review(offerings: list[str]) -> bool:
+    if not any((item or "").strip() for item in offerings):
+        return False
+    return _safe_writable_care_type(offerings) is None
 
 
 def _account_field_values(account: dict[str, Any]) -> dict[str, Any]:
@@ -112,7 +154,7 @@ def _account_field_values(account: dict[str, Any]) -> dict[str, Any]:
 
 def _normalized_equal(field_name: str, left: Any, right: Any) -> bool:
     if field_name == fields.NAME:
-        return normalize_name(left) == normalize_name(right)
+        return normalize_name_for_comparison(left) == normalize_name_for_comparison(right)
     if field_name == fields.STREET:
         return normalize_street_for_comparison(left) == normalize_street_for_comparison(right)
     if field_name == fields.ZIP:
@@ -154,6 +196,41 @@ def _field_diffs(facility: Facility, account: dict[str, Any]) -> tuple[dict[str,
 
 def _is_bellhaven_child(account: dict[str, Any], parent_id: str) -> bool:
     return str(account.get(fields.PARENT_ID) or "") == parent_id
+
+
+def _add_care_type_review(
+    batch: ProposalBatch,
+    facility: Facility,
+    *,
+    account_id: str | None,
+    current_care_type: Any = "",
+) -> None:
+    """Review-only. Never chooses a care_type and never proposes a composite."""
+    if not _care_type_needs_review(facility.care_types):
+        return
+    supported, unsupported = _classify_care_types(facility.care_types)
+    current = {fields.CARE_TYPE: current_care_type} if account_id else {}
+    batch.add(
+        Proposal(
+            action_type=ACTION_REVIEW_CARE_TYPE,
+            account_id=account_id,
+            facility_url=facility.url,
+            current_values=current,
+            proposed_values={},
+            evidence={
+                "website_care_types": list(facility.care_types),
+                "supported_care_types": supported,
+                "unsupported_care_types": unsupported,
+                "facility_name": facility.name,
+            },
+            confidence="review",
+            requires_review=True,
+            reason=(
+                "website care offerings are not a single supported CRM care_type; "
+                "do not write a composite or choose one automatically"
+            ),
+        )
+    )
 
 
 def generate_proposals(
@@ -289,6 +366,7 @@ def generate_proposals(
                             "chow_kind": decision.kind,
                             "match_tier": result.tier,
                             "match_reasons": list(result.reasons),
+                            "website_care_types": list(facility.care_types),
                         },
                         confidence=result.confidence,
                         requires_review=True,
@@ -364,6 +442,13 @@ def generate_proposals(
                 )
             )
 
+        _add_care_type_review(
+            batch,
+            facility,
+            account_id=account_id,
+            current_care_type=account.get(fields.CARE_TYPE, ""),
+        )
+
     # Unmatched website facilities → create only when scrape + parent are trusted.
     for result in matches:
         if result.account is not None or result.ambiguous:
@@ -388,12 +473,14 @@ def generate_proposals(
                     "facility_name": facility.name,
                     "sources": list(facility.sources),
                     "match_reasons": list(result.reasons),
+                    "website_care_types": list(facility.care_types),
                 },
                 confidence="medium",
                 requires_review=True,
                 reason="website facility has no safe CRM match; propose new Bellhaven child",
             )
         )
+        _add_care_type_review(batch, facility, account_id=None)
 
     # Possible stale Bellhaven children: only when scrape is complete.
     if scrape_ok and parent_ok and parent.account_id:
@@ -472,6 +559,7 @@ def _summarize(batch: ProposalBatch) -> dict[str, int]:
         "review_stale_or_missing": 0,
         "review_chow_ambiguous": 0,
         "review_inactive_account": 0,
+        "review_care_type": 0,
         "blockers": len(batch.blockers),
     }
     for proposal in batch.proposals:
