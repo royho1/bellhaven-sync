@@ -102,6 +102,7 @@ def format_sync_summary(result: SyncResult) -> str:
         f"Duplicates:          {summary.get('review_duplicate', 0)}",
         f"Possible stale:      {summary.get('review_stale_or_missing', 0)}",
         f"CHOW human-review:   {summary.get('review_chow_ambiguous', 0)}",
+        f"Inactive matches:    {summary.get('review_inactive_account', 0)}",
         f"Parent resolved:     {result.parent_resolved}",
         f"Scrape complete:     {result.batch.scrape_complete}",
         f"Blockers:            {summary.get('blockers', 0)}",

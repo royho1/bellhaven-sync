@@ -24,6 +24,7 @@ ACTION_REVIEW_AMBIGUOUS = "review_ambiguous"
 ACTION_REVIEW_DUPLICATE = "review_duplicate"
 ACTION_REVIEW_STALE = "review_stale_or_missing"
 ACTION_REVIEW_CHOW = "review_chow_ambiguous"
+ACTION_REVIEW_INACTIVE = "review_inactive_account"
 
 STATUS_PENDING = "pending"
 STATUS_APPROVED = "approved"
@@ -338,6 +339,31 @@ def generate_proposals(
                     )
                 )
 
+        # Status stays out of COMPARABLE_FIELDS. An inactive match is review-only
+        # and never proposes reactivation, including when field updates are suppressed.
+        if str(account.get(fields.STATUS) or "").strip() == fields.STATUS_INACTIVE:
+            batch.add(
+                Proposal(
+                    action_type=ACTION_REVIEW_INACTIVE,
+                    account_id=account_id,
+                    facility_url=facility.url,
+                    current_values={fields.STATUS: fields.STATUS_INACTIVE},
+                    proposed_values={},
+                    evidence={
+                        "match_tier": result.tier,
+                        "match_reasons": list(result.reasons),
+                        "facility_name": facility.name,
+                        "status": fields.STATUS_INACTIVE,
+                    },
+                    confidence="review",
+                    requires_review=True,
+                    reason=(
+                        "website facility exists and matches this CRM account, "
+                        "but the CRM account is inactive"
+                    ),
+                )
+            )
+
     # Unmatched website facilities → create only when scrape + parent are trusted.
     for result in matches:
         if result.account is not None or result.ambiguous:
@@ -445,6 +471,7 @@ def _summarize(batch: ProposalBatch) -> dict[str, int]:
         "review_duplicate": 0,
         "review_stale_or_missing": 0,
         "review_chow_ambiguous": 0,
+        "review_inactive_account": 0,
         "blockers": len(batch.blockers),
     }
     for proposal in batch.proposals:

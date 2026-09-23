@@ -98,7 +98,8 @@ Four branches, each reviewed and merged before the next starts:
   **Do not merge until Codex is clean. Do not start Branch 4 yet.**
 - Branch 3 decisions:
   1. Explicit proposal action types in `proposals.py` (update/reparent/CHOW/create/
-     ambiguous/duplicate/stale/chow-review). No invented merge/delete/deactivate.
+     ambiguous/duplicate/stale/chow-review/inactive-review). No invented
+     merge/delete/deactivate.
   2. `chow.py` isolates parent-change policy; zero revenue + positive AR is human
      review; revenue+AR uses two-step CHOW plan; otherwise direct re-parent.
   3. Two-step CHOW suppresses `update_fields` on the old account; website values
@@ -126,7 +127,12 @@ Four branches, each reviewed and merged before the next starts:
      `update_fields` on matched accounts: no reparent, no CHOW, and no
      independently approvable field write until the Bellhaven parent is known.
      A resolved correct parent still emits normal `update_fields`.
-- Test suite on this branch: **119 passed**, fixture-based, no network required.
+  11. A confident match to a CRM account with `status == "Inactive"` emits
+     `review_inactive_account` only. `STATUS` stays out of `COMPARABLE_FIELDS`.
+     The proposal records the inactive status and match evidence and does not
+     set status to Active. Ordinary field diffs may still be proposed when
+     existing safety rules allow them. No automatic reactivation.
+- Test suite on this branch: **122 passed**, fixture-based, no network required.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
 - Next after a clean merge of PR #3: `feat/apply-and-schedule`.
 

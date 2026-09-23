@@ -11,6 +11,7 @@ from bellhaven_sync.proposals import (
     ACTION_REVIEW_AMBIGUOUS,
     ACTION_REVIEW_CHOW,
     ACTION_REVIEW_DUPLICATE,
+    ACTION_REVIEW_INACTIVE,
     ACTION_REVIEW_STALE,
     ACTION_UPDATE_FIELDS,
     generate_proposals,
@@ -481,3 +482,83 @@ def test_every_ambiguous_candidate_is_retained_beyond_display_runners():
     assert stale_ids.isdisjoint(expected_ids)
     automatic = {ACTION_UPDATE_FIELDS, ACTION_REPARENT, ACTION_CHOW}
     assert all(p.action_type not in automatic for p in batch.proposals)
+
+
+def _proposes_status(proposal) -> bool:
+    values = proposal.proposed_values
+    if fields.STATUS in values:
+        return True
+    template = values.get("new_account_template")
+    if isinstance(template, dict) and fields.STATUS in template:
+        return True
+    patch = values.get("old_account_patch")
+    return isinstance(patch, dict) and fields.STATUS in patch
+
+
+def test_matched_inactive_account_is_review_only():
+    facility = _facility()
+    account = _account(**{fields.STATUS: fields.STATUS_INACTIVE})
+    matches = match_facilities([facility], [account])
+    assert matches[0].account is not None
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=matches,
+        parent=_parent(),
+        duplicates=[],
+    )
+    inactive = [p for p in batch.proposals if p.action_type == ACTION_REVIEW_INACTIVE]
+    assert len(inactive) == 1
+    assert len(batch.proposals) == 1
+    review = inactive[0]
+    assert review.account_id == account[fields.ACCOUNT_ID]
+    assert review.facility_url == facility.url
+    assert review.current_values[fields.STATUS] == fields.STATUS_INACTIVE
+    assert review.evidence["status"] == fields.STATUS_INACTIVE
+    assert review.evidence["facility_name"] == facility.name
+    assert review.proposed_values == {}
+    assert review.requires_review is True
+    assert "inactive" in review.reason
+    assert batch.summary["review_inactive_account"] == 1
+    assert all(not _proposes_status(p) for p in batch.proposals)
+
+
+def test_matched_active_account_has_no_inactive_review():
+    facility = _facility()
+    account = _account(**{fields.STATUS: fields.STATUS_ACTIVE})
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=match_facilities([facility], [account]),
+        parent=_parent(),
+        duplicates=[],
+    )
+    assert all(p.action_type != ACTION_REVIEW_INACTIVE for p in batch.proposals)
+    assert batch.summary["review_inactive_account"] == 0
+
+
+def test_inactive_match_with_field_diff_keeps_both_reviews():
+    facility = _facility(phone="419-555-9999")
+    account = _account(
+        **{
+            fields.STATUS: fields.STATUS_INACTIVE,
+            fields.PARENT_ID: "PARENT",
+            fields.PHONE: "419-555-0100",
+        }
+    )
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=match_facilities([facility], [account]),
+        parent=_parent(),
+        duplicates=[],
+    )
+    inactive = [p for p in batch.proposals if p.action_type == ACTION_REVIEW_INACTIVE]
+    updates = [p for p in batch.proposals if p.action_type == ACTION_UPDATE_FIELDS]
+    assert len(inactive) == 1
+    assert inactive[0].current_values[fields.STATUS] == fields.STATUS_INACTIVE
+    assert inactive[0].proposed_values == {}
+    assert len(updates) == 1
+    assert updates[0].proposed_values == {fields.PHONE: "419-555-9999"}
+    assert fields.STATUS not in updates[0].proposed_values
+    assert all(not _proposes_status(p) for p in batch.proposals)
