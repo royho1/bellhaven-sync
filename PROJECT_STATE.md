@@ -180,9 +180,14 @@ Four branches, each reviewed and merged before the next starts:
      because a prior process may already have written to the CRM. No time-based
      lock expiry and no silent claim takeover.
   20. Create duplicate/recovery identity (`_same_identity`) uses stable name and
-     billing address fields only. Phone is ignored so blank proposed phones cannot
-     miss an otherwise exact CRM account.
-- Test suite on this branch: **165 passed**, fixture-based, no live POST/PATCH.
+     billing address fields only. Phone is ignored. Blank or whitespace-only
+     proposed address fields are skipped as unavailable evidence, so a missing
+     city/ZIP cannot reject an otherwise matching CRM account.
+  21. Create and CHOW create paths also take an atomic `create_identity_locks`
+     reservation (parent + non-blank identity fields) while the attempt is
+     `in_progress`, so two different proposal IDs for the same facility cannot
+     both POST. The lock is released when the attempt leaves `in_progress`.
+- Test suite on this branch: **168 passed**, fixture-based, no live POST/PATCH.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
 - Real-world limit: execute mode is implemented and tested with fake sessions
   only. It has not been run against the assessment API.

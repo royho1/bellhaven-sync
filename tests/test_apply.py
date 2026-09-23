@@ -1213,3 +1213,115 @@ def test_claim_after_applied_reports_already_applied(tmp_path):
     )
     assert result.status == CLAIM_ALREADY_APPLIED
     assert len([a for a in store.list_attempts(stored.id) if a.state == STATE_IN_PROGRESS]) == 0
+
+
+def test_blank_proposed_city_zip_still_match_existing_non_tool_account(settings, tmp_path):
+    from bellhaven_sync import apply as apply_mod
+
+    store = ProposalStore(tmp_path / "db.sqlite")
+    proposed = {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine St",
+        fields.CITY: "  ",
+        fields.STATE: "OH",
+        fields.ZIP: "",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    outsider = _account(
+        "OUT1",
+        **{
+            fields.NAME: "Brand New Place",
+            fields.STREET: "9 Pine St",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44880",
+            fields.PARENT_ID: "PARENT",
+            fields.CREATED_BY_CANDIDATE: False,
+        },
+    )
+    session = CrmFake({"PARENT": _parent(), "OUT1": outsider})
+    stored = _approve(store, _create_proposal(proposed))
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert session.posts == []
+    assert store.created_account_id_for_proposal(stored.id) is None
+    body = {**proposed, fields.CREATED_BY_CANDIDATE: True}
+    assert apply_mod._same_identity(outsider, body) is True
+    assert "not created by this tool" in (store.list_attempts(stored.id)[-1].error_text or "")
+
+
+def test_blank_proposed_city_zip_recovers_tool_created_account(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    proposed = {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine St",
+        fields.CITY: "",
+        fields.STATE: "OH",
+        fields.ZIP: "   ",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    owned = _account(
+        "OWN1",
+        **{
+            fields.NAME: "Brand New Place",
+            fields.STREET: "9 Pine St",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44880",
+            fields.PARENT_ID: "PARENT",
+            fields.CREATED_BY_CANDIDATE: True,
+        },
+    )
+    session = CrmFake({"PARENT": _parent(), "OWN1": owned})
+    stored = _approve(store, _create_proposal(proposed))
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.applied == 1
+    assert session.posts == []
+    assert store.successful_attempt(stored.id).created_account_id == "OWN1"
+
+
+def test_same_create_identity_blocks_second_proposal_from_posting(settings, tmp_path):
+    from bellhaven_sync import apply as apply_mod
+
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    proposed = {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine St",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44880",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    first, second = _approve_many(store, _create_proposal(proposed), _create_proposal(proposed))
+    first_claim = store.claim_execute_attempt(
+        proposal_id=first.id,
+        run_id=first.run_id,
+        action_type=ACTION_CREATE_ACCOUNT,
+    )
+    assert first_claim.status == CLAIM_CLAIMED
+    assert first_claim.attempt is not None
+    body = {**proposed, fields.CREATED_BY_CANDIDATE: True}
+    assert store.claim_create_identity(
+        identity_key=apply_mod._create_identity_key(body),
+        proposal_id=first.id,
+        attempt_id=first_claim.attempt.id,
+    )
+
+    report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=second.run_id,
+        proposal_id=second.id,
+        execute=True,
+    )
+    assert report.blocked == 1
+    assert session.posts == []
+    assert session.patches == []
+    error = store.list_attempts(second.id)[-1].error_text or ""
+    assert "already creating an account with this identity" in error
+    assert store.list_attempts(first.id)[-1].state == STATE_IN_PROGRESS

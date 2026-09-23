@@ -79,6 +79,10 @@ IN_PROGRESS_CLAIM_MESSAGE = (
     "A previous execute attempt is still in_progress. It may have been interrupted "
     "after a CRM write. Refusing another execution until the prior attempt is reconciled."
 )
+CREATE_IDENTITY_BUSY_MESSAGE = (
+    "Another execute attempt is already creating an account with this identity. "
+    "Refusing a concurrent create until the prior attempt finishes or is reconciled."
+)
 
 
 class ApplyError(RuntimeError):
@@ -409,7 +413,13 @@ def _execute(
         )
         return None
     if proposal.action_type == ACTION_CREATE_ACCOUNT:
-        return _create_account(proposal, store=store, session=session, settings=settings)
+        return _create_account(
+            proposal,
+            store=store,
+            session=session,
+            settings=settings,
+            attempt_id=attempt_id,
+        )
     if proposal.action_type == ACTION_CHOW:
         return _apply_chow(proposal, settings=settings, store=store, session=session, attempt_id=attempt_id)
     raise ApplyError(f"unknown action {proposal.action_type!r}")
@@ -432,11 +442,13 @@ def _create_account(
     store: ProposalStore,
     session: Any,
     settings: Settings,
+    attempt_id: int,
 ) -> str:
     proposed = proposal.proposed_values
     body = {key: proposed[key] for key in CREATE_FIELDS_ALLOW if key in proposed}
     body[fields.CREATED_BY_CANDIDATE] = True
     _require_account(str(body[fields.PARENT_ID]), session, settings)
+    _claim_create_identity(store, body, proposal_id=proposal.id, attempt_id=attempt_id)
     recovered = _resolve_create_id(
         body,
         proposal,
@@ -495,6 +507,7 @@ def _apply_chow(
         create_body = {key: template[key] for key in CREATE_FIELDS_ALLOW if key in template}
         create_body[fields.PARENT_ID] = parent_id
         create_body[fields.CREATED_BY_CANDIDATE] = True
+        _claim_create_identity(store, create_body, proposal_id=proposal.id, attempt_id=attempt_id)
         recovered = _resolve_create_id(
             create_body,
             proposal,
@@ -585,14 +598,59 @@ def _resolve_create_id(
     return None
 
 
+def _evidence_text(value: Any) -> str | None:
+    """Return stripped text evidence, or None when the proposed value is blank/missing."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def _create_identity_key(body: dict[str, Any]) -> str:
+    """Normalized create identity for cross-proposal execute serialization."""
+    parent = str(body.get(fields.PARENT_ID) or "").strip()
+    parts = [f"parent={parent}"]
+    for key in CREATE_IDENTITY_FIELDS:
+        if key not in body:
+            continue
+        value = _evidence_text(body.get(key))
+        if value is None:
+            continue
+        parts.append(f"{key}={value}")
+    return "\n".join(parts)
+
+
+def _claim_create_identity(
+    store: ProposalStore,
+    body: dict[str, Any],
+    *,
+    proposal_id: int,
+    attempt_id: int,
+) -> None:
+    key = _create_identity_key(body)
+    if not store.claim_create_identity(
+        identity_key=key,
+        proposal_id=proposal_id,
+        attempt_id=attempt_id,
+    ):
+        raise ApplyError(CREATE_IDENTITY_BUSY_MESSAGE)
+
+
 def _same_identity(account: dict[str, Any], body: dict[str, Any]) -> bool:
-    """Stable create/recovery identity: name and address only. Phone is ignored."""
+    """Stable create/recovery identity: name and address only. Phone is ignored.
+
+    Blank or whitespace-only proposed fields are unavailable evidence and are
+    skipped, so a missing city/ZIP does not reject an otherwise matching account.
+    """
     compared = False
     for key in CREATE_IDENTITY_FIELDS:
         if key not in body:
             continue
+        proposed = _evidence_text(body.get(key))
+        if proposed is None:
+            continue
         compared = True
-        if not _same(body.get(key), account.get(key)):
+        if not _same(proposed, account.get(key)):
             return False
     return compared
 

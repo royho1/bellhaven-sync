@@ -67,6 +67,15 @@ CREATE INDEX IF NOT EXISTS idx_application_attempts_proposal
 CREATE UNIQUE INDEX IF NOT EXISTS idx_application_attempts_one_execute_in_progress
     ON application_attempts(proposal_id)
     WHERE mode = 'execute' AND state = 'in_progress';
+
+CREATE TABLE IF NOT EXISTS create_identity_locks (
+    identity_key TEXT PRIMARY KEY,
+    proposal_id INTEGER NOT NULL,
+    attempt_id INTEGER NOT NULL,
+    claimed_at TEXT NOT NULL,
+    FOREIGN KEY (proposal_id) REFERENCES proposals(id),
+    FOREIGN KEY (attempt_id) REFERENCES application_attempts(id)
+);
 """
 
 
@@ -408,6 +417,58 @@ class ProposalStore:
         assert attempt is not None
         return ClaimResult(CLAIM_CLAIMED, attempt)
 
+    def claim_create_identity(
+        self,
+        *,
+        identity_key: str,
+        proposal_id: int,
+        attempt_id: int,
+    ) -> bool:
+        """Reserve a normalized create identity for one in-progress execute attempt.
+
+        Returns True if this attempt holds the lock. Returns False if another
+        proposal/attempt already holds it. Re-claiming the same attempt_id is OK.
+        """
+        if not identity_key:
+            raise ValueError("create identity key is required")
+        claimed_at = _now()
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT proposal_id, attempt_id FROM create_identity_locks WHERE identity_key = ?",
+                (identity_key,),
+            ).fetchone()
+            if row is not None:
+                if int(row["attempt_id"]) == attempt_id:
+                    conn.commit()
+                    return True
+                conn.commit()
+                return False
+            conn.execute(
+                """
+                INSERT INTO create_identity_locks (
+                    identity_key, proposal_id, attempt_id, claimed_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (identity_key, proposal_id, attempt_id, claimed_at),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def release_create_identity_for_attempt(self, attempt_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM create_identity_locks WHERE attempt_id = ?",
+                (attempt_id,),
+            )
+            conn.commit()
+
     def update_attempt(
         self,
         attempt_id: int,
@@ -432,6 +493,11 @@ class ProposalStore:
             )
             if cur.rowcount != 1:
                 raise KeyError(f"application attempt {attempt_id} not found")
+            if state != STATE_IN_PROGRESS:
+                conn.execute(
+                    "DELETE FROM create_identity_locks WHERE attempt_id = ?",
+                    (attempt_id,),
+                )
             conn.commit()
         attempt = self.get_attempt(attempt_id)
         assert attempt is not None
