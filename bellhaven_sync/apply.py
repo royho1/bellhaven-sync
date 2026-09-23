@@ -50,6 +50,7 @@ from .store import (
     STATE_IN_PROGRESS,
     STATE_PLANNED,
     STATE_UNCERTAIN,
+    CreateIdentityParts,
     ProposalStore,
     StoredProposal,
 )
@@ -83,9 +84,9 @@ CREATE_FIELDS_ALLOW = UPDATE_FIELDS_ALLOW | {fields.PARENT_ID, fields.STATUS}
 CREATE_STATUS_ALLOW = frozenset({fields.STATUS_ACTIVE, fields.STATUS_INACTIVE})
 SUPPORTED_CARE = frozenset(SUPPORTED_CARE_TYPES)
 CREATE_IDENTITY_FIELDS = (fields.NAME, fields.STREET, fields.CITY, fields.STATE, fields.ZIP)
-# Lock key uses only consistently available facility core fields so optional city/ZIP
-# coverage cannot split one facility into separate reservation namespaces.
-CREATE_LOCK_IDENTITY_FIELDS = (fields.NAME, fields.STREET, fields.STATE)
+# Core lock fields are always required. City/ZIP are optional discriminators checked
+# under structured overlap rules so partial vs complete same-facility still conflicts.
+CREATE_LOCK_CORE_FIELDS = (fields.NAME, fields.STREET, fields.STATE)
 IN_PROGRESS_CLAIM_MESSAGE = (
     "A previous execute attempt is still in_progress. It may have been interrupted "
     "after a CRM write. Refusing another execution until the prior attempt is reconciled."
@@ -93,6 +94,10 @@ IN_PROGRESS_CLAIM_MESSAGE = (
 CREATE_IDENTITY_BUSY_MESSAGE = (
     "Another execute attempt is already creating an account with this identity. "
     "Refusing a concurrent create until the prior attempt finishes or is reconciled."
+)
+ACCOUNT_WRITE_BUSY_MESSAGE = (
+    "Another execute attempt is already writing to this CRM account. "
+    "Refusing a concurrent mutation until the prior attempt finishes or is reconciled."
 )
 NOT_APPROVED_CLAIM_MESSAGE = (
     "Proposal is no longer approved. Refusing execute; no CRM write."
@@ -421,10 +426,17 @@ def _execute(
     attempt_id: int,
 ) -> str | None:
     if proposal.action_type == ACTION_UPDATE_FIELDS:
-        _patch_existing(proposal, session, settings, dict(proposal.proposed_values))
+        _patch_existing(
+            proposal,
+            store,
+            session,
+            settings,
+            dict(proposal.proposed_values),
+            attempt_id=attempt_id,
+        )
         return None
     if proposal.action_type == ACTION_REPARENT:
-        _apply_reparent(proposal, session, settings)
+        _apply_reparent(proposal, store, session, settings, attempt_id=attempt_id)
         return None
     if proposal.action_type == ACTION_CREATE_ACCOUNT:
         return _create_account(
@@ -441,17 +453,39 @@ def _execute(
 
 def _patch_existing(
     proposal: StoredProposal,
+    store: ProposalStore,
     session: Any,
     settings: Settings,
     body: dict[str, Any],
+    *,
+    attempt_id: int,
 ) -> None:
+    _claim_account_write(
+        store,
+        account_id=str(proposal.account_id),
+        proposal_id=proposal.id,
+        attempt_id=attempt_id,
+    )
     live = _require_account(str(proposal.account_id), session, settings)
     _require_fresh(proposal.current_values, live)
     _patch(session, settings, str(proposal.account_id), body)
 
 
-def _apply_reparent(proposal: StoredProposal, session: Any, settings: Settings) -> None:
+def _apply_reparent(
+    proposal: StoredProposal,
+    store: ProposalStore,
+    session: Any,
+    settings: Settings,
+    *,
+    attempt_id: int,
+) -> None:
     target_parent = str(proposal.proposed_values[fields.PARENT_ID])
+    _claim_account_write(
+        store,
+        account_id=str(proposal.account_id),
+        proposal_id=proposal.id,
+        attempt_id=attempt_id,
+    )
     _require_account(target_parent, session, settings)
     live = _require_account(str(proposal.account_id), session, settings)
     _require_fresh(proposal.current_values, live)
@@ -512,6 +546,13 @@ def _apply_chow(
     parent_id = str(proposal.proposed_values["new_account_parent_id"])
     template = proposal.proposed_values["new_account_template"]
     remembered = store.created_account_id_for_proposal(proposal.id)
+    # Serialize old-account mutation before any CRM preflight that precedes the PATCH.
+    _claim_account_write(
+        store,
+        account_id=old_id,
+        proposal_id=proposal.id,
+        attempt_id=attempt_id,
+    )
     live = _require_account(old_id, session, settings)
     linked = str(live.get(fields.CHOW_CURRENT_ACCOUNT) or "")
 
@@ -524,9 +565,7 @@ def _apply_chow(
             parent_id=parent_id,
             template=template,
         )
-        # Link already complete; clear any identity lock retained by an earlier
-        # uncertain attempt for this proposal so cleanup is not stuck on the old attempt id.
-        store.release_create_identity_for_proposal(proposal.id)
+        # Keep identity/account reservations until _consider records STATE_APPLIED.
         return remembered
     if linked and remembered and linked != remembered:
         raise ApplyError(
@@ -704,28 +743,31 @@ def _canonical_identity_value(key: str, value: Any) -> str | None:
     return canon if canon else None
 
 
-def _create_identity_key(body: dict[str, Any]) -> str:
-    """Canonical core create identity for cross-proposal execute serialization.
-
-    Uses parent + normalized name/street/state only. Optional city/ZIP are omitted
-    so differing optional-field coverage cannot create separate lock namespaces.
-    """
+def _create_identity_parts(body: dict[str, Any]) -> CreateIdentityParts:
+    """Canonical structured create identity for overlap-aware reservations."""
     parent = str(body.get(fields.PARENT_ID) or "").strip()
-    parts = [f"parent={parent}"]
-    for key in CREATE_LOCK_IDENTITY_FIELDS:
+    if not parent:
+        raise ApplyError(
+            "Cannot form a safe create identity lock from the approved create body "
+            "(missing parent_id). Refusing create."
+        )
+    core: dict[str, str] = {}
+    for key in CREATE_LOCK_CORE_FIELDS:
         value = _canonical_identity_value(key, body.get(key))
         if value is None:
             raise ApplyError(
                 "Cannot form a safe create identity lock from the approved create body "
                 f"(missing usable {key}). Refusing create."
             )
-        parts.append(f"{key}={value}")
-    if not parent:
-        raise ApplyError(
-            "Cannot form a safe create identity lock from the approved create body "
-            "(missing parent_id). Refusing create."
-        )
-    return "\n".join(parts)
+        core[key] = value
+    return CreateIdentityParts(
+        parent_id=parent,
+        name_norm=core[fields.NAME],
+        street_norm=core[fields.STREET],
+        state_norm=core[fields.STATE],
+        city_norm=_canonical_identity_value(fields.CITY, body.get(fields.CITY)),
+        zip_norm=_canonical_identity_value(fields.ZIP, body.get(fields.ZIP)),
+    )
 
 
 def _claim_create_identity(
@@ -735,13 +777,28 @@ def _claim_create_identity(
     proposal_id: int,
     attempt_id: int,
 ) -> None:
-    key = _create_identity_key(body)
+    identity = _create_identity_parts(body)
     if not store.claim_create_identity(
-        identity_key=key,
+        identity=identity,
         proposal_id=proposal_id,
         attempt_id=attempt_id,
     ):
         raise ApplyError(CREATE_IDENTITY_BUSY_MESSAGE)
+
+
+def _claim_account_write(
+    store: ProposalStore,
+    *,
+    account_id: str,
+    proposal_id: int,
+    attempt_id: int,
+) -> None:
+    if not store.claim_account_write(
+        account_id=account_id,
+        proposal_id=proposal_id,
+        attempt_id=attempt_id,
+    ):
+        raise ApplyError(ACCOUNT_WRITE_BUSY_MESSAGE)
 
 
 def _same_identity(account: dict[str, Any], body: dict[str, Any]) -> bool:

@@ -1319,7 +1319,7 @@ def test_same_create_identity_blocks_second_proposal_from_posting(settings, tmp_
     assert first_claim.attempt is not None
     body = {**proposed, fields.CREATED_BY_CANDIDATE: True}
     assert store.claim_create_identity(
-        identity_key=apply_mod._create_identity_key(body),
+        identity=apply_mod._create_identity_parts(body),
         proposal_id=first.id,
         attempt_id=first_claim.attempt.id,
     )
@@ -1457,8 +1457,8 @@ def test_equivalent_street_formatting_shares_create_identity(settings, tmp_path)
         fields.PARENT_ID: "PARENT",
         fields.STATUS: "Active",
     }
-    assert apply_mod._create_identity_key({**first_body, fields.CREATED_BY_CANDIDATE: True}) == (
-        apply_mod._create_identity_key({**second_body, fields.CREATED_BY_CANDIDATE: True})
+    assert apply_mod._create_identity_parts({**first_body, fields.CREATED_BY_CANDIDATE: True}) == (
+        apply_mod._create_identity_parts({**second_body, fields.CREATED_BY_CANDIDATE: True})
     )
     owned = _account(
         "OWN1",
@@ -1646,9 +1646,14 @@ def test_optional_city_zip_coverage_shares_create_identity_lock(settings, tmp_pa
         fields.PARENT_ID: "PARENT",
         fields.STATUS: "Active",
     }
-    assert apply_mod._create_identity_key({**with_zip, fields.CREATED_BY_CANDIDATE: True}) == (
-        apply_mod._create_identity_key({**without_optional, fields.CREATED_BY_CANDIDATE: True})
+    first_parts = apply_mod._create_identity_parts({**with_zip, fields.CREATED_BY_CANDIDATE: True})
+    second_parts = apply_mod._create_identity_parts(
+        {**without_optional, fields.CREATED_BY_CANDIDATE: True}
     )
+    assert first_parts.overlaps(second_parts)
+    assert first_parts.name_norm == second_parts.name_norm
+    assert first_parts.street_norm == second_parts.street_norm
+    assert first_parts.state_norm == second_parts.state_norm
     first, second = _approve_many(
         store,
         _create_proposal(with_zip),
@@ -1662,7 +1667,7 @@ def test_optional_city_zip_coverage_shares_create_identity_lock(settings, tmp_pa
     assert first_claim.status == CLAIM_CLAIMED
     assert first_claim.attempt is not None
     assert store.claim_create_identity(
-        identity_key=apply_mod._create_identity_key({**with_zip, fields.CREATED_BY_CANDIDATE: True}),
+        identity=first_parts,
         proposal_id=first.id,
         attempt_id=first_claim.attempt.id,
     )
@@ -1746,3 +1751,498 @@ def test_remembered_chow_successor_still_valid_links_without_second_post(setting
     assert len(session.posts) == 1
     assert session.patches[-1] == ("OLD1", {fields.CHOW_CURRENT_ACCOUNT: new_id})
     assert session.accounts["OLD1"][fields.CHOW_CURRENT_ACCOUNT] == new_id
+
+
+def _update_proposal(account_id: str = "C1", **proposed) -> Proposal:
+    current = {
+        fields.PHONE: "419-555-0100",
+        fields.NAME: "Bellhaven of Tiffin",
+        fields.STREET: "100 Main Street",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44883",
+    }
+    body = proposed or {fields.PHONE: "419-555-9999"}
+    return Proposal(
+        action_type=ACTION_UPDATE_FIELDS,
+        account_id=account_id,
+        facility_url="https://example.test/a",
+        current_values={key: current[key] for key in body if key in current},
+        proposed_values=body,
+        evidence={},
+        confidence="high",
+    )
+
+
+def _reparent_proposal(account_id: str = "C1") -> Proposal:
+    return Proposal(
+        action_type=ACTION_REPARENT,
+        account_id=account_id,
+        facility_url="https://example.test/a",
+        current_values={
+            fields.PARENT_ID: "OLD",
+            fields.LIFETIME_REVENUE: 0,
+            fields.OUTSTANDING_AR: 0,
+        },
+        proposed_values={fields.PARENT_ID: "PARENT"},
+        evidence={},
+        confidence="high",
+    )
+
+
+def test_same_account_update_proposals_cannot_patch_concurrently(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1"), "PARENT": _parent()})
+    first, second = _approve_many(
+        store,
+        _update_proposal(**{fields.PHONE: "419-555-1111"}),
+        _update_proposal(**{fields.PHONE: "419-555-2222"}),
+    )
+    first_claim = store.claim_execute_attempt(
+        proposal_id=first.id,
+        run_id=first.run_id,
+        action_type=ACTION_UPDATE_FIELDS,
+    )
+    assert first_claim.status == CLAIM_CLAIMED
+    assert first_claim.attempt is not None
+    assert store.claim_account_write(
+        account_id="C1",
+        proposal_id=first.id,
+        attempt_id=first_claim.attempt.id,
+    )
+
+    report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=second.run_id,
+        proposal_id=second.id,
+        execute=True,
+    )
+    assert report.blocked == 1
+    assert session.patches == []
+    error = store.list_attempts(second.id)[-1].error_text or ""
+    assert "already writing to this CRM account" in error
+
+
+def test_update_and_reparent_same_account_conflict(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake(
+        {
+            "C1": _account("C1", **{fields.PARENT_ID: "OLD", fields.LIFETIME_REVENUE: 0, fields.OUTSTANDING_AR: 0}),
+            "PARENT": _parent(),
+            "OLD": _account("OLD"),
+        }
+    )
+    first, second = _approve_many(
+        store,
+        _update_proposal(**{fields.PHONE: "419-555-1111"}),
+        _reparent_proposal(),
+    )
+    first_claim = store.claim_execute_attempt(
+        proposal_id=first.id,
+        run_id=first.run_id,
+        action_type=ACTION_UPDATE_FIELDS,
+    )
+    assert first_claim.status == CLAIM_CLAIMED
+    assert first_claim.attempt is not None
+    assert store.claim_account_write(
+        account_id="C1",
+        proposal_id=first.id,
+        attempt_id=first_claim.attempt.id,
+    )
+
+    report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=second.run_id,
+        proposal_id=second.id,
+        execute=True,
+    )
+    assert report.blocked == 1
+    assert session.patches == []
+    assert "already writing to this CRM account" in (store.list_attempts(second.id)[-1].error_text or "")
+
+
+def test_uncertain_account_patch_retains_lock_against_other_proposal(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1"), "PARENT": _parent()})
+    session.lose_patch_response = 1
+    first, second = _approve_many(
+        store,
+        _update_proposal(**{fields.PHONE: "419-555-1111"}),
+        _update_proposal(**{fields.PHONE: "419-555-2222"}),
+    )
+
+    first_report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=first.run_id,
+        proposal_id=first.id,
+        execute=True,
+    )
+    assert first_report.failed == 1
+    assert len(session.patches) == 1
+    assert store.list_attempts(first.id)[-1].state == STATE_UNCERTAIN
+    assert store.has_account_write_lock_for_proposal(first.id)
+    original_lock_attempt = store.account_write_lock_attempt_id("C1")
+
+    second_report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=second.run_id,
+        proposal_id=second.id,
+        execute=True,
+    )
+    assert second_report.blocked == 1
+    assert len(session.patches) == 1
+    assert "already writing to this CRM account" in (store.list_attempts(second.id)[-1].error_text or "")
+    assert store.account_write_lock_attempt_id("C1") == original_lock_attempt
+
+
+def test_different_account_write_not_blocked_by_account_lock(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1"), "C2": _account("C2"), "PARENT": _parent()})
+    first, second = _approve_many(
+        store,
+        _update_proposal("C1", **{fields.PHONE: "419-555-1111"}),
+        _update_proposal("C2", **{fields.PHONE: "419-555-2222"}),
+    )
+    first_claim = store.claim_execute_attempt(
+        proposal_id=first.id,
+        run_id=first.run_id,
+        action_type=ACTION_UPDATE_FIELDS,
+    )
+    assert first_claim.status == CLAIM_CLAIMED
+    assert first_claim.attempt is not None
+    assert store.claim_account_write(
+        account_id="C1",
+        proposal_id=first.id,
+        attempt_id=first_claim.attempt.id,
+    )
+
+    report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=second.run_id,
+        proposal_id=second.id,
+        execute=True,
+    )
+    assert report.applied == 1
+    assert session.patches == [("C2", {fields.PHONE: "419-555-2222"})]
+
+
+def test_create_identity_complete_vs_partial_same_facility_conflicts(settings, tmp_path):
+    from bellhaven_sync import apply as apply_mod
+
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    complete = {
+        fields.NAME: "Bellhaven of Findlay",
+        fields.STREET: "100 Main St",
+        fields.CITY: "Findlay",
+        fields.STATE: "OH",
+        fields.ZIP: "45840",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    partial = {
+        fields.NAME: "Bellhaven of Findlay",
+        fields.STREET: "100 Main Street",
+        fields.STATE: "OH",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    complete_parts = apply_mod._create_identity_parts({**complete, fields.CREATED_BY_CANDIDATE: True})
+    partial_parts = apply_mod._create_identity_parts({**partial, fields.CREATED_BY_CANDIDATE: True})
+    assert complete_parts.overlaps(partial_parts)
+
+    first, second = _approve_many(store, _create_proposal(complete), _create_proposal(partial))
+    first_claim = store.claim_execute_attempt(
+        proposal_id=first.id,
+        run_id=first.run_id,
+        action_type=ACTION_CREATE_ACCOUNT,
+    )
+    assert first_claim.attempt is not None
+    assert store.claim_create_identity(
+        identity=complete_parts,
+        proposal_id=first.id,
+        attempt_id=first_claim.attempt.id,
+    )
+    report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=second.run_id,
+        proposal_id=second.id,
+        execute=True,
+    )
+    assert report.blocked == 1
+    assert session.posts == []
+
+
+def test_create_identity_missing_zip_still_conflicts(settings, tmp_path):
+    from bellhaven_sync import apply as apply_mod
+
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    with_zip = {
+        fields.NAME: "Bellhaven of Findlay",
+        fields.STREET: "100 Main St",
+        fields.CITY: "Findlay",
+        fields.STATE: "OH",
+        fields.ZIP: "45840",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    without_zip = {
+        fields.NAME: "Bellhaven of Findlay",
+        fields.STREET: "100 Main St",
+        fields.CITY: "Findlay",
+        fields.STATE: "OH",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    assert apply_mod._create_identity_parts({**with_zip, fields.CREATED_BY_CANDIDATE: True}).overlaps(
+        apply_mod._create_identity_parts({**without_zip, fields.CREATED_BY_CANDIDATE: True})
+    )
+    first, second = _approve_many(store, _create_proposal(with_zip), _create_proposal(without_zip))
+    first_claim = store.claim_execute_attempt(
+        proposal_id=first.id,
+        run_id=first.run_id,
+        action_type=ACTION_CREATE_ACCOUNT,
+    )
+    assert first_claim.attempt is not None
+    assert store.claim_create_identity(
+        identity=apply_mod._create_identity_parts({**with_zip, fields.CREATED_BY_CANDIDATE: True}),
+        proposal_id=first.id,
+        attempt_id=first_claim.attempt.id,
+    )
+    report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=second.run_id,
+        proposal_id=second.id,
+        execute=True,
+    )
+    assert report.blocked == 1
+    assert session.posts == []
+
+
+def test_create_identity_different_cities_do_not_conflict(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    findlay = {
+        fields.NAME: "Bellhaven Commons",
+        fields.STREET: "100 Main St",
+        fields.CITY: "Findlay",
+        fields.STATE: "OH",
+        fields.ZIP: "45840",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    tiffin = {
+        fields.NAME: "Bellhaven Commons",
+        fields.STREET: "100 Main St",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44883",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    first, second = _approve_many(store, _create_proposal(findlay), _create_proposal(tiffin))
+    first_claim = store.claim_execute_attempt(
+        proposal_id=first.id,
+        run_id=first.run_id,
+        action_type=ACTION_CREATE_ACCOUNT,
+    )
+    assert first_claim.attempt is not None
+    from bellhaven_sync import apply as apply_mod
+
+    assert store.claim_create_identity(
+        identity=apply_mod._create_identity_parts({**findlay, fields.CREATED_BY_CANDIDATE: True}),
+        proposal_id=first.id,
+        attempt_id=first_claim.attempt.id,
+    )
+    report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=second.run_id,
+        proposal_id=second.id,
+        execute=True,
+    )
+    assert report.applied == 1
+    assert len(session.posts) == 1
+    assert session.posts[0][fields.CITY] == "Tiffin"
+
+
+def test_create_identity_different_zips_same_city_do_not_conflict(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    zip_a = {
+        fields.NAME: "Bellhaven Commons",
+        fields.STREET: "100 Main St",
+        fields.CITY: "Findlay",
+        fields.STATE: "OH",
+        fields.ZIP: "45840",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    zip_b = {
+        fields.NAME: "Bellhaven Commons",
+        fields.STREET: "100 Main St",
+        fields.CITY: "Findlay",
+        fields.STATE: "OH",
+        fields.ZIP: "45841",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    first, second = _approve_many(store, _create_proposal(zip_a), _create_proposal(zip_b))
+    first_claim = store.claim_execute_attempt(
+        proposal_id=first.id,
+        run_id=first.run_id,
+        action_type=ACTION_CREATE_ACCOUNT,
+    )
+    assert first_claim.attempt is not None
+    from bellhaven_sync import apply as apply_mod
+
+    assert store.claim_create_identity(
+        identity=apply_mod._create_identity_parts({**zip_a, fields.CREATED_BY_CANDIDATE: True}),
+        proposal_id=first.id,
+        attempt_id=first_claim.attempt.id,
+    )
+    report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=second.run_id,
+        proposal_id=second.id,
+        execute=True,
+    )
+    assert report.applied == 1
+    assert len(session.posts) == 1
+    assert session.posts[0][fields.ZIP] == "45841"
+
+
+def test_create_identity_formatting_variants_normalize(settings, tmp_path):
+    from bellhaven_sync import apply as apply_mod
+
+    first = {
+        fields.NAME: "Bellhaven of Tiffin",
+        fields.STREET: "100 Main Street",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44883",
+        fields.PARENT_ID: "PARENT",
+    }
+    second = {
+        fields.NAME: "Bellhaven of Tiffin",
+        fields.STREET: "100 Main St.",
+        fields.CITY: "tiffin",
+        fields.STATE: "oh",
+        fields.ZIP: "44883-1234",
+        fields.PARENT_ID: "PARENT",
+    }
+    a = apply_mod._create_identity_parts({**first, fields.CREATED_BY_CANDIDATE: True})
+    b = apply_mod._create_identity_parts({**second, fields.CREATED_BY_CANDIDATE: True})
+    assert a == b
+    assert a.overlaps(b)
+
+
+def test_uncertain_create_lock_survives_blocked_retry(settings, tmp_path):
+    """Same-proposal retry must not transfer/drop an uncertain create reservation."""
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    session.post_failures = 1
+    proposed = {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine St",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44880",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    first, outsider = _approve_many(store, _create_proposal(proposed), _create_proposal(proposed))
+
+    first_report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=first.run_id,
+        proposal_id=first.id,
+        execute=True,
+    )
+    assert first_report.failed == 1
+    assert store.list_attempts(first.id)[-1].state == STATE_UNCERTAIN
+    original_lock_attempt = store.create_identity_lock_attempt_id(first.id)
+    assert original_lock_attempt is not None
+
+    # Inject ambiguous tool-created twins so the retry blocks without a second POST.
+    template = {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine St",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44880",
+        fields.PARENT_ID: "PARENT",
+        fields.CREATED_BY_CANDIDATE: True,
+    }
+    session.accounts["OWN-A"] = _account("OWN-A", **template)
+    session.accounts["OWN-B"] = _account("OWN-B", **template)
+
+    retry = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=first.run_id,
+        proposal_id=first.id,
+        execute=True,
+    )
+    assert retry.blocked == 1
+    assert len(session.posts) == 1
+    assert store.list_attempts(first.id)[-1].state == STATE_BLOCKED
+    # Lock remains owned by the original uncertain attempt, not the blocked retry.
+    assert store.has_create_identity_lock_for_proposal(first.id)
+    assert store.create_identity_lock_attempt_id(first.id) == original_lock_attempt
+
+    outsider_report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=outsider.run_id,
+        proposal_id=outsider.id,
+        execute=True,
+    )
+    assert outsider_report.blocked == 1
+    assert len(session.posts) == 1
+    assert "already creating an account with this identity" in (
+        store.list_attempts(outsider.id)[-1].error_text or ""
+    )
+
+
+def test_chow_reconcile_releases_locks_only_on_applied(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    old = _account(
+        "OLD1",
+        **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300},
+    )
+    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _wrong_parent()})
+    session.lose_patch_response = 1
+    stored = _approve(store, _chow_proposal())
+
+    first = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert first.failed == 1
+    assert store.has_create_identity_lock_for_proposal(stored.id)
+    assert store.has_account_write_lock_for_proposal(stored.id)
+
+    second = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert second.applied == 1
+    assert not store.has_create_identity_lock_for_proposal(stored.id)
+    assert not store.has_account_write_lock_for_proposal(stored.id)

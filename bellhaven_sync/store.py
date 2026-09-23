@@ -69,7 +69,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_application_attempts_one_execute_in_progre
     WHERE mode = 'execute' AND state = 'in_progress';
 
 CREATE TABLE IF NOT EXISTS create_identity_locks (
-    identity_key TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_id TEXT NOT NULL,
+    name_norm TEXT NOT NULL,
+    street_norm TEXT NOT NULL,
+    state_norm TEXT NOT NULL,
+    city_norm TEXT,
+    zip_norm TEXT,
+    proposal_id INTEGER NOT NULL,
+    attempt_id INTEGER NOT NULL,
+    claimed_at TEXT NOT NULL,
+    FOREIGN KEY (proposal_id) REFERENCES proposals(id),
+    FOREIGN KEY (attempt_id) REFERENCES application_attempts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_create_identity_locks_core
+    ON create_identity_locks(parent_id, name_norm, street_norm, state_norm);
+
+CREATE TABLE IF NOT EXISTS account_write_locks (
+    account_id TEXT PRIMARY KEY,
     proposal_id INTEGER NOT NULL,
     attempt_id INTEGER NOT NULL,
     claimed_at TEXT NOT NULL,
@@ -107,10 +125,10 @@ CLAIM_ALREADY_APPLIED = "already_applied"
 CLAIM_IN_PROGRESS = "in_progress"
 CLAIM_NOT_APPROVED = "not_approved"
 
-# Leave create-identity locks in place for uncertain writes; release only when safe.
-_CREATE_IDENTITY_RELEASE_STATES = frozenset(
-    {STATE_APPLIED, STATE_BLOCKED, STATE_FAILED}
-)
+# Leave write reservations in place for uncertain outcomes; release only when safe.
+# Blocked/failed release only reservations owned by *this* attempt_id so an older
+# uncertain attempt's lock is not dropped by a later same-proposal retry.
+_WRITE_LOCK_RELEASE_STATES = frozenset({STATE_BLOCKED, STATE_FAILED})
 
 ATTEMPT_MODES = frozenset({MODE_DRY_RUN, MODE_EXECUTE})
 ATTEMPT_STATES = frozenset(
@@ -129,6 +147,37 @@ ATTEMPT_STATES = frozenset(
 class ClaimResult:
     status: str
     attempt: ApplicationAttempt | None = None
+
+
+@dataclass(frozen=True)
+class CreateIdentityParts:
+    """Structured canonical create identity for overlap-aware reservations."""
+
+    parent_id: str
+    name_norm: str
+    street_norm: str
+    state_norm: str
+    city_norm: str | None = None
+    zip_norm: str | None = None
+
+    def overlaps(self, other: CreateIdentityParts) -> bool:
+        """True when two reservations must not both be held.
+
+        Same core identity conflicts unless optional city/ZIP evidence on both
+        sides positively proves the facilities are different.
+        """
+        if (
+            self.parent_id != other.parent_id
+            or self.name_norm != other.name_norm
+            or self.street_norm != other.street_norm
+            or self.state_norm != other.state_norm
+        ):
+            return False
+        if self.city_norm and other.city_norm and self.city_norm != other.city_norm:
+            return False
+        if self.zip_norm and other.zip_norm and self.zip_norm != other.zip_norm:
+            return False
+        return True
 
 
 @dataclass(frozen=True)
@@ -181,6 +230,39 @@ class ProposalStore:
     def init_db(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA_SQL)
+            self._migrate_lock_tables(conn)
+            conn.commit()
+
+    def _migrate_lock_tables(self, conn: sqlite3.Connection) -> None:
+        """Rebuild create_identity_locks when an older opaque-key schema is present."""
+        cols = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(create_identity_locks)").fetchall()
+        }
+        if not cols:
+            return
+        if "identity_key" in cols or "name_norm" not in cols:
+            conn.execute("DROP TABLE IF EXISTS create_identity_locks")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS create_identity_locks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_id TEXT NOT NULL,
+                    name_norm TEXT NOT NULL,
+                    street_norm TEXT NOT NULL,
+                    state_norm TEXT NOT NULL,
+                    city_norm TEXT,
+                    zip_norm TEXT,
+                    proposal_id INTEGER NOT NULL,
+                    attempt_id INTEGER NOT NULL,
+                    claimed_at TEXT NOT NULL,
+                    FOREIGN KEY (proposal_id) REFERENCES proposals(id),
+                    FOREIGN KEY (attempt_id) REFERENCES application_attempts(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_create_identity_locks_core
+                    ON create_identity_locks(parent_id, name_norm, street_norm, state_norm);
+                """
+            )
 
     def save_run(self, batch: ProposalBatch, *, started_at: str | None = None) -> int:
         """Persist a new reconciliation run and its proposals. Never mutates old rows."""
@@ -434,41 +516,58 @@ class ProposalStore:
     def claim_create_identity(
         self,
         *,
-        identity_key: str,
+        identity: CreateIdentityParts,
         proposal_id: int,
         attempt_id: int,
     ) -> bool:
-        """Reserve a normalized create identity across proposals.
+        """Reserve a create identity across proposals using structured overlap rules.
 
-        Returns True if this attempt holds the lock. The same proposal may transfer
-        an existing reservation onto a newer attempt (uncertain-write recovery).
-        A different proposal cannot take the lock while it is held.
+        Returns True if this proposal may proceed. The same proposal may continue
+        while an older uncertain attempt still owns the reservation; ownership is
+        not transferred onto the retry attempt. A different proposal cannot take
+        an overlapping lock while it is held.
         """
-        if not identity_key:
-            raise ValueError("create identity key is required")
+        if not (
+            identity.parent_id
+            and identity.name_norm
+            and identity.street_norm
+            and identity.state_norm
+        ):
+            raise ValueError("create identity core fields are required")
         claimed_at = _now()
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT proposal_id, attempt_id FROM create_identity_locks WHERE identity_key = ?",
-                (identity_key,),
-            ).fetchone()
-            if row is not None:
+            rows = conn.execute(
+                """
+                SELECT id, parent_id, name_norm, street_norm, state_norm,
+                       city_norm, zip_norm, proposal_id, attempt_id
+                FROM create_identity_locks
+                WHERE parent_id = ? AND name_norm = ? AND street_norm = ? AND state_norm = ?
+                """,
+                (
+                    identity.parent_id,
+                    identity.name_norm,
+                    identity.street_norm,
+                    identity.state_norm,
+                ),
+            ).fetchall()
+            for row in rows:
+                held = CreateIdentityParts(
+                    parent_id=str(row["parent_id"]),
+                    name_norm=str(row["name_norm"]),
+                    street_norm=str(row["street_norm"]),
+                    state_norm=str(row["state_norm"]),
+                    city_norm=str(row["city_norm"]) if row["city_norm"] else None,
+                    zip_norm=str(row["zip_norm"]) if row["zip_norm"] else None,
+                )
+                if not identity.overlaps(held):
+                    continue
                 holder_proposal = int(row["proposal_id"])
                 holder_attempt = int(row["attempt_id"])
-                if holder_attempt == attempt_id:
-                    conn.commit()
-                    return True
-                if holder_proposal == proposal_id:
-                    conn.execute(
-                        """
-                        UPDATE create_identity_locks
-                        SET attempt_id = ?, claimed_at = ?
-                        WHERE identity_key = ?
-                        """,
-                        (attempt_id, claimed_at, identity_key),
-                    )
+                if holder_attempt == attempt_id or holder_proposal == proposal_id:
+                    # Same proposal (or same attempt) may proceed; keep the original
+                    # uncertain attempt as lock owner so a blocked retry cannot drop it.
                     conn.commit()
                     return True
                 conn.commit()
@@ -476,10 +575,68 @@ class ProposalStore:
             conn.execute(
                 """
                 INSERT INTO create_identity_locks (
-                    identity_key, proposal_id, attempt_id, claimed_at
+                    parent_id, name_norm, street_norm, state_norm, city_norm, zip_norm,
+                    proposal_id, attempt_id, claimed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    identity.parent_id,
+                    identity.name_norm,
+                    identity.street_norm,
+                    identity.state_norm,
+                    identity.city_norm,
+                    identity.zip_norm,
+                    proposal_id,
+                    attempt_id,
+                    claimed_at,
+                ),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def claim_account_write(
+        self,
+        *,
+        account_id: str,
+        proposal_id: int,
+        attempt_id: int,
+    ) -> bool:
+        """Reserve exclusive mutation of an existing CRM account across proposals.
+
+        Same-proposal retries may continue without transferring ownership away from
+        an older uncertain attempt. Different proposals fail closed.
+        """
+        account_id = str(account_id or "").strip()
+        if not account_id:
+            raise ValueError("account_id is required for account write reservation")
+        claimed_at = _now()
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT proposal_id, attempt_id FROM account_write_locks WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if row is not None:
+                holder_proposal = int(row["proposal_id"])
+                holder_attempt = int(row["attempt_id"])
+                if holder_attempt == attempt_id or holder_proposal == proposal_id:
+                    conn.commit()
+                    return True
+                conn.commit()
+                return False
+            conn.execute(
+                """
+                INSERT INTO account_write_locks (
+                    account_id, proposal_id, attempt_id, claimed_at
                 ) VALUES (?, ?, ?, ?)
                 """,
-                (identity_key, proposal_id, attempt_id, claimed_at),
+                (account_id, proposal_id, attempt_id, claimed_at),
             )
             conn.commit()
             return True
@@ -506,6 +663,22 @@ class ProposalStore:
             )
             conn.commit()
 
+    def release_account_write_for_attempt(self, attempt_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM account_write_locks WHERE attempt_id = ?",
+                (attempt_id,),
+            )
+            conn.commit()
+
+    def release_account_write_for_proposal(self, proposal_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM account_write_locks WHERE proposal_id = ?",
+                (proposal_id,),
+            )
+            conn.commit()
+
     def has_create_identity_lock_for_proposal(self, proposal_id: int) -> bool:
         with self.connect() as conn:
             row = conn.execute(
@@ -513,6 +686,36 @@ class ProposalStore:
                 (proposal_id,),
             ).fetchone()
         return row is not None
+
+    def has_account_write_lock_for_proposal(self, proposal_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM account_write_locks WHERE proposal_id = ? LIMIT 1",
+                (proposal_id,),
+            ).fetchone()
+        return row is not None
+
+    def create_identity_lock_attempt_id(self, proposal_id: int) -> int | None:
+        """Attempt that currently owns the create-identity reservation, if any."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT attempt_id FROM create_identity_locks
+                WHERE proposal_id = ?
+                ORDER BY id
+                LIMIT 1
+                """,
+                (proposal_id,),
+            ).fetchone()
+        return int(row["attempt_id"]) if row is not None else None
+
+    def account_write_lock_attempt_id(self, account_id: str) -> int | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT attempt_id FROM account_write_locks WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+        return int(row["attempt_id"]) if row is not None else None
 
     def update_attempt(
         self,
@@ -544,13 +747,22 @@ class ProposalStore:
                     (attempt_id,),
                 ).fetchone()
                 if owned is not None:
+                    proposal_id = int(owned["proposal_id"])
                     conn.execute(
                         "DELETE FROM create_identity_locks WHERE proposal_id = ?",
-                        (int(owned["proposal_id"]),),
+                        (proposal_id,),
                     )
-            elif state in _CREATE_IDENTITY_RELEASE_STATES:
+                    conn.execute(
+                        "DELETE FROM account_write_locks WHERE proposal_id = ?",
+                        (proposal_id,),
+                    )
+            elif state in _WRITE_LOCK_RELEASE_STATES:
                 conn.execute(
                     "DELETE FROM create_identity_locks WHERE attempt_id = ?",
+                    (attempt_id,),
+                )
+                conn.execute(
+                    "DELETE FROM account_write_locks WHERE attempt_id = ?",
                     (attempt_id,),
                 )
             conn.commit()
