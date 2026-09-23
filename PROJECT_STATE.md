@@ -96,20 +96,15 @@ Four branches, each reviewed and merged before the next starts:
 - Branch 2 `feat/scrape-and-match` is open as [PR #2](https://github.com/royho1/bellhaven-sync/pull/2).
   **Do not merge until Codex is clean on the latest commit (no P1/P2).**
 - Latest Branch 2 fixes:
-  1. Matching uses max-cardinality min-cost bipartite assignment (successive
-     shortest augmenting paths) so a facility with alternatives does not consume
-     a scarce account another facility needs. Intrinsic ambiguity is decided on
-     each facility's full candidate list before assignment, so other matches
-     cannot quietly resolve human-review cases.
-  2. Scraper retains successfully fetched listing-facility HTML during the
-     internal-link discovery pass and reuses it during enrichment, avoiding
-     redundant requests and false enrichment failures when a second fetch would
-     flake.
-  3. Prior: house-number-required usable location; punctuated unit stripping;
-     location-less pages are enrichment failures; public scrape uses
-     `load_local_paths()` without CRM token; urls-only never complete; filler
-     phrases share the name punctuation pipeline.
-- Test suite on this branch: **86 passed**, fixture-based, no network required for
+  1. Unit designators require a whole-word match and a real separator before the
+     unit id, so street names like Stevens/Steele are not stripped as "Ste".
+  2. Match edge costs are lexicographic tuples `(tier, similarity_penalty,
+     facility_idx, account_rank)` so deterministic index tie-breaks can never
+     outweigh a better name similarity (or tier).
+  3. Prior: max-cardinality min-cost global assignment with intrinsic ambiguity
+     preserved; listing HTML reused during enrichment; house-number-required
+     usable location; punctuated unit stripping; urls-only never complete.
+- Test suite on this branch: **90 passed**, fixture-based, no network required for
   scraper/matcher tests.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; do not treat a failed live
   scrape as a product bug.

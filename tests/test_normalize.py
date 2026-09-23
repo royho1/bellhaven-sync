@@ -35,6 +35,24 @@ def test_punctuated_unit_designators_are_stripped():
     assert normalize_street("100 Main St Ste. 200") == ("100", "main st")
 
 
+def test_street_names_starting_with_ste_are_not_unit_designators():
+    # "ste" must be a whole word with a separator before the unit id; otherwise
+    # Stevens/Steele collapse to bare "st" and can falsely match other streets.
+    assert normalize_street("100 Stevens Street") == ("100", "stevens st")
+    assert normalize_street("100 Steele Street") == ("100", "steele st")
+    assert normalize_street("100 Stevens Street") != normalize_street("100 Main St Ste 200")
+
+
+def test_unit_suffix_forms_normalize_equivalently_to_bare_street():
+    bare = normalize_street("100 Main St")
+    assert normalize_street("100 Main St Ste 200") == bare
+    assert normalize_street("100 Main St Ste. 200") == bare
+    assert normalize_street("100 Main St Apt 2") == bare
+    assert normalize_street("100 Main St Apt. 2") == bare
+    assert normalize_street("100 Main St Suite 200") == bare
+    assert normalize_street("100 Main Street Suite 200") == bare
+
+
 def test_zip_keeps_first_five_digits():
     assert normalize_zip("45344-1234") == "45344"
     assert normalize_zip("45344") == "45344"

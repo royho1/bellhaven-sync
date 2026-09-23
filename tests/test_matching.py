@@ -527,3 +527,76 @@ def test_assignment_reranks_after_best_account_is_consumed():
     assert results["https://example.test/tier2"].tier == 2
     # F_fallback's only remaining claim was the weaker tier-3 on B; it must not win.
     assert results["https://example.test/fallback"].account is None
+
+
+def test_higher_name_similarity_beats_earlier_facility_order():
+    """Exact name match must beat a near match listed earlier at the same tier.
+
+    With the old packed integer cost, facility_idx * 1000 could outweigh a
+    similarity gap of ~0.02 once enough earlier facilities preceded the exact
+    match. Lexicographic costs keep similarity strictly above index order.
+    """
+    from difflib import SequenceMatcher
+
+    from bellhaven_sync.normalize import normalize_name
+
+    account = _account(
+        **{
+            fields.ACCOUNT_ID: "A",
+            fields.NAME: "Alpha Oaks",
+            fields.STREET: "100 Oak Street",
+            fields.CITY: "Akron",
+            fields.STATE: "OH",
+            fields.ZIP: "44301",
+        }
+    )
+    near_name = "Alpha Oakes"
+    exact_name = "Alpha Oaks"
+    near_sim = SequenceMatcher(
+        None, normalize_name(near_name), normalize_name(exact_name)
+    ).ratio()
+    assert 0.94 <= near_sim < 1.0
+
+    # Enough earlier near-matches that idx*1000 would exceed the similarity gap
+    # under the previous packed encoding (~20k for a 0.02 gap).
+    near_facilities = [
+        _facility(
+            name=near_name,
+            street="100 Oak St",
+            city="Akron",
+            state="OH",
+            zip="44301",
+            url=f"https://example.test/near-{i}",
+        )
+        for i in range(25)
+    ]
+    exact = _facility(
+        name=exact_name,
+        street="100 Oak St",
+        city="Akron",
+        state="OH",
+        zip="44301",
+        url="https://example.test/exact",
+    )
+
+    for facilities in (near_facilities + [exact], [exact] + near_facilities):
+        results = match_facilities(facilities, [account])
+        matched = [r for r in results if r.account is not None]
+        assert len(matched) == 1
+        assert matched[0].facility.url == "https://example.test/exact"
+        assert matched[0].name_similarity == 1.0
+
+
+def test_edge_cost_similarity_dominates_index_tiebreak():
+    """Any similarity improvement must beat any facility/account index pair."""
+    from bellhaven_sync.matching import MatchCandidate, _edge_cost
+
+    better = MatchCandidate("A", tier=1, name_similarity=1.0, reasons=("x",))
+    worse = MatchCandidate("A", tier=1, name_similarity=0.98, reasons=("x",))
+    # Extreme indices that previously could outweigh a 0.02 similarity gap.
+    assert _edge_cost(better, facility_idx=10_000, account_rank=10_000) < _edge_cost(
+        worse, facility_idx=0, account_rank=0
+    )
+    same_sim_earlier = _edge_cost(better, facility_idx=0, account_rank=0)
+    same_sim_later = _edge_cost(better, facility_idx=1, account_rank=0)
+    assert same_sim_earlier < same_sim_later

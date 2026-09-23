@@ -172,14 +172,26 @@ def _is_intrinsically_ambiguous(
     return False, []
 
 
-def _edge_cost(candidate: MatchCandidate, facility_idx: int, account_rank: int) -> int:
-    """Lower is better: tier first, then higher name similarity, then stable ids."""
-    return (
-        candidate.tier * 1_000_000_000
-        + int(round((1.0 - candidate.name_similarity) * 1_000_000))
-        + facility_idx * 1_000
-        + account_rank
-    )
+# Lexicographic edge cost: (tier, similarity penalty, facility_idx, account_rank).
+# Tuple ordering guarantees a better tier or higher similarity always beats any
+# amount of deterministic index tie-breaking, independent of graph size.
+EdgeCost = tuple[int, int, int, int]
+_COST_ZERO: EdgeCost = (0, 0, 0, 0)
+_COST_INF: EdgeCost = (10**18, 0, 0, 0)
+
+
+def _edge_cost(candidate: MatchCandidate, facility_idx: int, account_rank: int) -> EdgeCost:
+    """Lower is better: tier, then higher name similarity, then stable ids."""
+    similarity_penalty = int(round((1.0 - candidate.name_similarity) * 1_000_000))
+    return (candidate.tier, similarity_penalty, facility_idx, account_rank)
+
+
+def _add_cost(left: EdgeCost, right: EdgeCost) -> EdgeCost:
+    return (left[0] + right[0], left[1] + right[1], left[2] + right[2], left[3] + right[3])
+
+
+def _sub_cost(left: EdgeCost, right: EdgeCost) -> EdgeCost:
+    return (left[0] - right[0], left[1] - right[1], left[2] - right[2], left[3] - right[3])
 
 
 def _min_cost_max_matching(
@@ -189,7 +201,7 @@ def _min_cost_max_matching(
     """Max-cardinality bipartite matching with min total edge cost.
 
     Successive shortest augmenting paths. Prefer more matches first, then lower
-    tiers / higher similarities via edge costs. Deterministic.
+    tiers / higher similarities via lexicographic edge costs. Deterministic.
     """
     f_list = sorted(facility_indices)
     if not f_list:
@@ -202,7 +214,7 @@ def _min_cost_max_matching(
         return {}
 
     a_rank = {aid: i for i, aid in enumerate(account_ids)}
-    edges: dict[tuple[int, str], tuple[int, MatchCandidate]] = {}
+    edges: dict[tuple[int, str], tuple[EdgeCost, MatchCandidate]] = {}
     for fi in f_list:
         for candidate in candidates_by_idx[fi]:
             edges[(fi, candidate.account_id)] = (
@@ -213,11 +225,10 @@ def _min_cost_max_matching(
     match_fac: dict[int, str] = {}
     match_acc: dict[str, int] = {}
     chosen: dict[int, MatchCandidate] = {}
-    inf = 10**18
 
     def augment() -> bool:
-        dist_f = {fi: inf for fi in f_list}
-        dist_a = {aid: inf for aid in account_ids}
+        dist_f: dict[int, EdgeCost] = {fi: _COST_INF for fi in f_list}
+        dist_a: dict[str, EdgeCost] = {aid: _COST_INF for aid in account_ids}
         parent_a: dict[str, int] = {}
         parent_f: dict[int, str] = {}
         queue: list[tuple[str, int | str]] = []
@@ -226,12 +237,12 @@ def _min_cost_max_matching(
 
         for fi in f_list:
             if fi not in match_fac:
-                dist_f[fi] = 0
+                dist_f[fi] = _COST_ZERO
                 queue.append(("f", fi))
                 in_f.add(fi)
 
         best_free_acc: str | None = None
-        best_free_dist = inf
+        best_free_dist: EdgeCost = _COST_INF
 
         while queue:
             kind, node = queue.pop(0)
@@ -245,7 +256,7 @@ def _min_cost_max_matching(
                     if match_fac.get(fi) == aid:
                         continue
                     cost, _ = edges[key]
-                    nd = dist_f[fi] + cost
+                    nd = _add_cost(dist_f[fi], cost)
                     if nd < dist_a[aid]:
                         dist_a[aid] = nd
                         parent_a[aid] = fi
@@ -268,7 +279,7 @@ def _min_cost_max_matching(
                     continue
                 fi = match_acc[aid]
                 cost, _ = edges[(fi, aid)]
-                nd = dist_a[aid] - cost
+                nd = _sub_cost(dist_a[aid], cost)
                 if nd < dist_f[fi]:
                     dist_f[fi] = nd
                     parent_f[fi] = aid

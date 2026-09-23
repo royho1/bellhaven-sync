@@ -53,8 +53,10 @@ DIRECTION_ABBREV = {
     "southwest": "sw",
 }
 
+# Designator must be a whole word, and a real separator must precede the unit
+# id. Zero-width separators would let "ste" eat the start of "Stevens"/"Steele".
 UNIT_WORD_RE = re.compile(
-    r"\b(?:suite|ste|unit|apt|apartment)\.?\s*[a-z0-9-]+\b",
+    r"\b(?:apartment|suite|unit|apt|ste)\.?\s+[a-z0-9-]+\b",
     re.IGNORECASE,
 )
 # "#2" / " # 2" cannot use \b before "#", so handle the hash form separately.
