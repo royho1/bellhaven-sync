@@ -148,15 +148,28 @@ Four branches, each reviewed and merged before the next starts:
   14. `normalize_name()` stays lossy for matching. Proposal name comparison uses
      `normalize_name_for_comparison()`, which keeps qualifiers such as Memory
      Care, Assisted Living, and parenthetical words.
-  15. Apply lives only in `apply.py`, reached through `python -m bellhaven_sync.apply_cli`.
+     15. Apply lives only in `apply.py`, reached through `python -m bellhaven_sync.apply_cli`.
      `crm_client.py` stays GET-only. `cli sync` and `scripts/run_scheduled_sync.sh`
      cannot import the write path. Writes require an approved writable proposal,
      a fresh CRM preflight, `DRY_RUN=false`, and `--execute`. Review-only actions
      never write. CHOW POSTs a new account, stores that id, then PATCHes the old
-     account with only `chow_current_account`. A lost POST is not retried; the
-     next run reuses the stored id. Application attempts are a separate SQLite
-     table and do not overwrite approval status.
-- Test suite on this branch: **150 passed**, fixture-based, no live POST/PATCH.
+     account with only `chow_current_account`. Application attempts are a separate
+     SQLite table and do not overwrite approval status.
+  16. Uncertain write outcomes (`ApplyError(uncertain=True)`) persist as attempt
+     state `uncertain`, not ordinary `failed`/`blocked`. That durable flag is how
+     resume knows a prior POST may have succeeded without an id.
+  17. CHOW never issues a second POST after an uncertain POST. With no persisted
+     `created_account_id`, it scans for an exact tool-created match
+     (`created_by_candidate`, correct parent, approved identity/address). Exactly
+     one match is recovered and linked; more than one stops for human review; zero
+     matches with a prior uncertain attempt refuse another POST fail-closed; zero
+     matches with no prior uncertain attempt may POST once.
+  18. Recovery-scan CRM read failures (`crm_client.CrmError` from
+     `_matching_created_accounts`) become `ApplyError` for the current proposal
+     only. The attempt ends blocked/failed; later approved proposals in the same
+     `run_apply()` invocation are still considered. No POST/PATCH on an untrusted
+     scan.
+- Test suite on this branch: **154 passed**, fixture-based, no live POST/PATCH.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
 - Real-world limit: execute mode is implemented and tested with fake sessions
   only. It has not been run against the assessment API.

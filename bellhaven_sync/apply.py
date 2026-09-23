@@ -3,9 +3,10 @@
 This is the only module that may POST or PATCH. ``crm_client`` stays GET-only,
 and the scheduled sync path never imports this file.
 
-Writes are single-shot. A lost POST response is not retried, because the
-account may already exist. CHOW saves the new account id before linking the
-old account, so a later run can finish the link without creating a duplicate.
+Writes are single-shot. A lost POST response is not retried blindly: the attempt
+is recorded as uncertain, and the next run recovers a unique tool-created account
+before linking. CHOW saves the new account id before linking the old account, so
+a later run can finish the link without creating a duplicate.
 """
 
 from __future__ import annotations
@@ -35,9 +36,9 @@ from .store import (
     MODE_EXECUTE,
     STATE_APPLIED,
     STATE_BLOCKED,
-    STATE_FAILED,
     STATE_IN_PROGRESS,
     STATE_PLANNED,
+    STATE_UNCERTAIN,
     ProposalStore,
     StoredProposal,
 )
@@ -244,7 +245,10 @@ def _consider(
     try:
         created = _execute(proposal, settings=settings, store=store, session=session, attempt_id=attempt.id)
     except ApplyError as exc:
-        state = STATE_BLOCKED if not exc.uncertain else STATE_FAILED
+        if exc.uncertain:
+            state = STATE_UNCERTAIN
+        else:
+            state = STATE_BLOCKED
         store.update_attempt(attempt.id, state=state, error_text=str(exc))
         if state == STATE_BLOCKED:
             report.blocked += 1
@@ -441,11 +445,32 @@ def _apply_chow(
         create_body = {key: template[key] for key in CREATE_FIELDS_ALLOW if key in template}
         create_body[fields.PARENT_ID] = parent_id
         create_body[fields.CREATED_BY_CANDIDATE] = True
-        payload = _post(session, settings, "/accounts", create_body)
-        new_id = _account_id(payload)
-        if not new_id:
-            raise ApplyError("CHOW POST returned no account_id; old account was not patched", uncertain=True)
-        store.update_attempt(attempt_id, state=STATE_IN_PROGRESS, created_account_id=new_id)
+        existing = _matching_created_accounts(create_body, session, settings)
+        if len(existing) > 1:
+            raise ApplyError(
+                "multiple tool-created accounts match this CHOW create; stopping for human review"
+            )
+        if len(existing) == 1:
+            new_id = str(existing[0].get(fields.ACCOUNT_ID))
+            if not new_id:
+                raise ApplyError(
+                    "recovered CHOW account is missing account_id; stopping for human review"
+                )
+            store.update_attempt(attempt_id, state=STATE_IN_PROGRESS, created_account_id=new_id)
+        elif store.has_uncertain_attempt(proposal.id):
+            raise ApplyError(
+                "Previous CHOW POST outcome is uncertain and no unique created account "
+                "is visible yet. Refusing a second POST."
+            )
+        else:
+            payload = _post(session, settings, "/accounts", create_body)
+            new_id = _account_id(payload)
+            if not new_id:
+                raise ApplyError(
+                    "CHOW POST returned no account_id; old account was not patched",
+                    uncertain=True,
+                )
+            store.update_attempt(attempt_id, state=STATE_IN_PROGRESS, created_account_id=new_id)
 
     _patch(session, settings, old_id, {fields.CHOW_CURRENT_ACCOUNT: new_id})
     return new_id
@@ -457,13 +482,17 @@ def _matching_created_accounts(
     settings: Settings,
 ) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
-    for account in crm_client.iter_accounts(session=session, settings=settings):
-        if account.get(fields.CREATED_BY_CANDIDATE) is not True:
-            continue
-        if str(account.get(fields.PARENT_ID) or "") != str(body.get(fields.PARENT_ID) or ""):
-            continue
-        if _same_identity(account, body):
-            found.append(account)
+    try:
+        accounts = crm_client.iter_accounts(session=session, settings=settings)
+        for account in accounts:
+            if account.get(fields.CREATED_BY_CANDIDATE) is not True:
+                continue
+            if str(account.get(fields.PARENT_ID) or "") != str(body.get(fields.PARENT_ID) or ""):
+                continue
+            if _same_identity(account, body):
+                found.append(account)
+    except crm_client.CrmError as exc:
+        raise ApplyError(f"could not scan for previously created accounts: {exc}") from None
     return found
 
 

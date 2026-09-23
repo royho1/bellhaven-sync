@@ -87,10 +87,18 @@ STATE_IN_PROGRESS = "in_progress"
 STATE_APPLIED = "applied"
 STATE_BLOCKED = "blocked"
 STATE_FAILED = "failed"
+STATE_UNCERTAIN = "uncertain"
 
 ATTEMPT_MODES = frozenset({MODE_DRY_RUN, MODE_EXECUTE})
 ATTEMPT_STATES = frozenset(
-    {STATE_PLANNED, STATE_IN_PROGRESS, STATE_APPLIED, STATE_BLOCKED, STATE_FAILED}
+    {
+        STATE_PLANNED,
+        STATE_IN_PROGRESS,
+        STATE_APPLIED,
+        STATE_BLOCKED,
+        STATE_FAILED,
+        STATE_UNCERTAIN,
+    }
 )
 
 
@@ -393,6 +401,19 @@ class ProposalStore:
         if row is None:
             return None
         return str(row["created_account_id"])
+
+    def has_uncertain_attempt(self, proposal_id: int) -> bool:
+        """True when an execute-mode attempt recorded an uncertain write outcome."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM application_attempts
+                WHERE proposal_id = ? AND mode = ? AND state = ?
+                LIMIT 1
+                """,
+                (proposal_id, MODE_EXECUTE, STATE_UNCERTAIN),
+            ).fetchone()
+        return row is not None
 
     def action_types(self, *, run_id: int | None = None) -> list[str]:
         clauses: list[str] = []

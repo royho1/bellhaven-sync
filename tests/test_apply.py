@@ -23,7 +23,17 @@ from bellhaven_sync.proposals import (
     Proposal,
     ProposalBatch,
 )
-from bellhaven_sync.store import MODE_DRY_RUN, MODE_EXECUTE, STATE_APPLIED, STATE_BLOCKED, STATE_FAILED, STATE_PLANNED, ProposalStore
+from bellhaven_sync.store import (
+    MODE_DRY_RUN,
+    MODE_EXECUTE,
+    STATE_APPLIED,
+    STATE_BLOCKED,
+    STATE_FAILED,
+    STATE_IN_PROGRESS,
+    STATE_PLANNED,
+    STATE_UNCERTAIN,
+    ProposalStore,
+)
 from tests.conftest import FAKE_TOKEN, FakeResponse
 
 
@@ -34,11 +44,15 @@ class CrmFake:
         self.patches: list[tuple[str, dict[str, Any]]] = []
         self.post_failures = 0
         self.patch_failures = 0
+        self.lose_post_response = 0
+        self.list_error: Exception | None = None
         self._seq = 1
 
     def get(self, url: str, params: dict[str, Any] | None = None, timeout: Any = None) -> FakeResponse:
         path = url.rstrip("/")
         if path.endswith("/accounts"):
+            if self.list_error is not None:
+                raise self.list_error
             return FakeResponse({"data": list(self.accounts.values())})
         account_id = path.rsplit("/", 1)[-1]
         account = self.accounts.get(account_id)
@@ -56,6 +70,9 @@ class CrmFake:
         self._seq += 1
         created = {**body, fields.ACCOUNT_ID: account_id}
         self.accounts[account_id] = created
+        if self.lose_post_response:
+            self.lose_post_response -= 1
+            raise requests.Timeout(f"post response lost {FAKE_TOKEN}")
         return FakeResponse(created)
 
     def patch(self, url: str, json: dict[str, Any] | None = None, timeout: Any = None) -> FakeResponse:
@@ -69,9 +86,9 @@ class CrmFake:
         return FakeResponse(self.accounts[account_id])
 
 
-def _batch(proposal: Proposal) -> ProposalBatch:
+def _batch(*proposals: Proposal) -> ProposalBatch:
     return ProposalBatch(
-        proposals=[proposal],
+        proposals=list(proposals),
         scrape_complete=True,
         parent_account_id="PARENT",
         generated_at="2026-01-01T00:00:00+00:00",
@@ -84,6 +101,17 @@ def _approve(store: ProposalStore, proposal: Proposal, status: str = STATUS_APPR
     if status != STATUS_PENDING:
         store.set_status(stored.id, status)
     return store.get_proposal(stored.id)
+
+
+def _approve_many(store: ProposalStore, *proposals: Proposal, status: str = STATUS_APPROVED):
+    run_id = store.save_run(_batch(*proposals))
+    stored = store.list_proposals(run_id=run_id)
+    # list_proposals orders by id DESC; reverse for insertion order
+    stored = list(reversed(stored))
+    if status != STATUS_PENDING:
+        for item in stored:
+            store.set_status(item.id, status)
+    return [store.get_proposal(item.id) for item in stored]
 
 
 def _account(account_id: str, **extra) -> dict[str, Any]:
@@ -645,4 +673,184 @@ def test_post_is_not_retried_and_error_is_redacted(settings, tmp_path):
     error = store.list_attempts(stored.id)[-1].error_text or ""
     assert FAKE_TOKEN not in error
     assert "Not retrying" in error
-    assert store.list_attempts(stored.id)[-1].state == STATE_FAILED
+    assert store.list_attempts(stored.id)[-1].state == STATE_UNCERTAIN
+
+
+def _chow_proposal(*, account_id: str = "OLD1", template: dict[str, Any] | None = None) -> Proposal:
+    return Proposal(
+        action_type=ACTION_CHOW,
+        account_id=account_id,
+        facility_url="https://example.test/a",
+        current_values={
+            fields.PARENT_ID: "WRONG",
+            fields.NAME: "Bellhaven of Tiffin",
+            fields.STREET: "100 Main Street",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44883",
+            fields.LIFETIME_REVENUE: 9000,
+            fields.OUTSTANDING_AR: 300,
+        },
+        proposed_values={
+            "new_account_parent_id": "PARENT",
+            "new_account_template": template
+            or {
+                fields.NAME: "Bellhaven of Tiffin",
+                fields.STREET: "100 Main Street",
+                fields.CITY: "Tiffin",
+                fields.STATE: "OH",
+                fields.ZIP: "44883",
+                fields.PHONE: "419-555-0100",
+                fields.CARE_TYPE: "Memory Care",
+            },
+            "old_account_patch": {fields.CHOW_CURRENT_ACCOUNT: "<new_account_id>"},
+        },
+        evidence={},
+        confidence="high",
+    )
+
+
+def test_chow_recovers_lost_post_response_without_second_post(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    old = _account(
+        "OLD1",
+        **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300},
+    )
+    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _account("WRONG")})
+    session.lose_post_response = 1
+    stored = _approve(store, _chow_proposal())
+
+    first = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert first.failed == 1
+    assert len(session.posts) == 1
+    assert session.patches == []
+    assert store.created_account_id_for_proposal(stored.id) is None
+    assert store.has_uncertain_attempt(stored.id)
+    assert store.list_attempts(stored.id)[-1].state == STATE_UNCERTAIN
+    recovered_id = next(aid for aid in session.accounts if aid.startswith("NEW"))
+    assert session.accounts[recovered_id][fields.CREATED_BY_CANDIDATE] is True
+
+    second = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert second.applied == 1
+    assert len(session.posts) == 1
+    assert session.patches == [("OLD1", {fields.CHOW_CURRENT_ACCOUNT: recovered_id})]
+    assert store.successful_attempt(stored.id).created_account_id == recovered_id
+    assert session.accounts["OLD1"][fields.CHOW_CURRENT_ACCOUNT] == recovered_id
+
+
+def test_chow_uncertain_with_no_visible_account_refuses_second_post(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    old = _account(
+        "OLD1",
+        **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300},
+    )
+    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _account("WRONG")})
+    session.post_failures = 1
+    stored = _approve(store, _chow_proposal())
+
+    first = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert first.failed == 1
+    assert len(session.posts) == 1
+    assert store.has_uncertain_attempt(stored.id)
+    assert store.created_account_id_for_proposal(stored.id) is None
+
+    second = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert second.blocked == 1
+    assert len(session.posts) == 1
+    assert session.patches == []
+    assert store.successful_attempt(stored.id) is None
+    error = store.list_attempts(stored.id)[-1].error_text or ""
+    assert "Refusing a second POST" in error
+    assert store.list_attempts(stored.id)[-1].state == STATE_BLOCKED
+
+
+def test_chow_multiple_recovery_matches_blocks_without_write(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    template = {
+        fields.NAME: "Bellhaven of Tiffin",
+        fields.STREET: "100 Main Street",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44883",
+    }
+    twin_a = _account(
+        "OWN-A",
+        **{**template, fields.PARENT_ID: "PARENT", fields.CREATED_BY_CANDIDATE: True},
+    )
+    twin_b = _account(
+        "OWN-B",
+        **{**template, fields.PARENT_ID: "PARENT", fields.CREATED_BY_CANDIDATE: True},
+    )
+    old = _account(
+        "OLD1",
+        **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300},
+    )
+    session = CrmFake(
+        {
+            "OLD1": old,
+            "PARENT": _parent(),
+            "WRONG": _account("WRONG"),
+            "OWN-A": twin_a,
+            "OWN-B": twin_b,
+        }
+    )
+    stored = _approve(store, _chow_proposal(template=template))
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert session.posts == []
+    assert session.patches == []
+    assert "human review" in (store.list_attempts(stored.id)[-1].error_text or "")
+
+
+def test_recovery_scan_crm_error_stays_on_current_proposal(settings, tmp_path):
+    from bellhaven_sync import crm_client
+
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1"), "PARENT": _parent()})
+    session.list_error = crm_client.CrmError(f"list boom {FAKE_TOKEN}", status_code=500)
+    create_proposal = Proposal(
+        action_type=ACTION_CREATE_ACCOUNT,
+        account_id=None,
+        facility_url="https://example.test/new",
+        current_values={},
+        proposed_values={
+            fields.NAME: "Brand New Place",
+            fields.STREET: "9 Pine St",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44880",
+            fields.PARENT_ID: "PARENT",
+            fields.STATUS: "Active",
+        },
+        evidence={},
+        confidence="medium",
+    )
+    update_proposal = Proposal(
+        action_type=ACTION_UPDATE_FIELDS,
+        account_id="C1",
+        facility_url="https://example.test/a",
+        current_values={fields.PHONE: "419-555-0100"},
+        proposed_values={fields.PHONE: "419-555-9999"},
+        evidence={},
+        confidence="high",
+    )
+    update_stored, create_stored = _approve_many(store, update_proposal, create_proposal)
+    report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=create_stored.run_id,
+        execute=True,
+    )
+    assert report.blocked == 1
+    assert report.applied == 1
+    assert session.posts == []
+    create_attempts = store.list_attempts(create_stored.id)
+    assert create_attempts
+    assert create_attempts[-1].state == STATE_BLOCKED
+    assert create_attempts[-1].state != STATE_IN_PROGRESS
+    error = create_attempts[-1].error_text or ""
+    assert FAKE_TOKEN not in error
+    assert "could not scan" in error
+    assert store.successful_attempt(update_stored.id) is not None
+    assert session.patches == [("C1", {fields.PHONE: "419-555-9999"})]
