@@ -54,7 +54,7 @@ DIRECTION_ABBREV = {
 }
 
 UNIT_WORD_RE = re.compile(
-    r"\b(?:suite|ste|unit|apt|apartment)\s*[a-z0-9-]+\b",
+    r"\b(?:suite|ste|unit|apt|apartment)\.?\s*[a-z0-9-]+\b",
     re.IGNORECASE,
 )
 # "#2" / " # 2" cannot use \b before "#", so handle the hash form separately.

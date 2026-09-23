@@ -161,6 +161,37 @@ def test_page_without_location_evidence_is_enrichment_failure():
     assert not tiffin.street
 
 
+def test_po_box_address_is_not_usable_location_evidence():
+    # PO boxes parse to state/street text but no house number, and every match
+    # tier requires a house number, so enrichment must fail.
+    facility = scraper.parse_facility_page(
+        (FIXTURES / "po-box.html").read_text(encoding="utf-8"),
+        f"{BASE}/communities/bellhaven-of-ashtabula",
+    )
+    assert facility.state == "OH"
+    assert "box" in facility.street.lower() or "PO" in facility.street.upper() or facility.street
+    assert not scraper.has_usable_location(facility)
+
+    homepage = (FIXTURES / "homepage.html").read_text(encoding="utf-8").replace(
+        "35 communities", "5 communities"
+    )
+    result = scraper.scrape_bellhaven(
+        base_url=BASE,
+        fetch=fixture_fetcher(
+            {
+                f"{BASE}/": homepage,
+                f"{BASE}/communities/bellhaven-of-tiffin": (
+                    FIXTURES / "po-box.html"
+                ).read_text(encoding="utf-8"),
+            }
+        ),
+        enrich_pages=True,
+    )
+    assert result.complete is False
+    assert any("enrichment failed" in b.lower() for b in result.blockers)
+    assert any("usable location evidence" in b for b in result.blockers)
+
+
 def test_union_recovers_findlay_missing_from_listing():
     result = scraper.scrape_bellhaven(base_url=BASE, fetch=fixture_fetcher(), enrich_pages=True)
     urls = {f.url for f in result.facilities}

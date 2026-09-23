@@ -27,6 +27,14 @@ def test_hash_unit_designators_are_stripped():
     assert normalize_street("100 Main St #2") == ("100", "main st")
 
 
+def test_punctuated_unit_designators_are_stripped():
+    assert normalize_street("100 Main St Apt. 2") == normalize_street("100 Main St")
+    assert normalize_street("100 Main St Ste. 200") == normalize_street("100 Main St")
+    assert normalize_street("100 Main Street Suite. 12") == ("100", "main st")
+    assert normalize_street("100 Main St Apt. 2") == ("100", "main st")
+    assert normalize_street("100 Main St Ste. 200") == ("100", "main st")
+
+
 def test_zip_keeps_first_five_digits():
     assert normalize_zip("45344-1234") == "45344"
     assert normalize_zip("45344") == "45344"

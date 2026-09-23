@@ -95,17 +95,16 @@ Four branches, each reviewed and merged before the next starts:
 - Branch 1 `feat/schema-discovery` is merged to `main`.
 - Branch 2 `feat/scrape-and-match` is open as [PR #2](https://github.com/royho1/bellhaven-sync/pull/2).
   **Do not merge until Codex is clean on the latest commit (no P1/P2).**
-- Latest Branch 2 fixes on top of the matching re-rank / urls-only / filler-phrase work:
-  1. Enriched facility pages with no usable location evidence (missing state or street)
-     are treated as enrichment failures and force `complete=False`, even on HTTP 200.
-  2. Public `cli scrape` uses `load_local_paths()` and never requires
-     `CLIPBOARD_API_TOKEN`. CRM `discover` still requires the token via `load_settings()`.
-- Earlier Branch 2 hardening still in place: live re-rank assignment; house numbers
-  required for tier-1/2 and duplicate keys; exact homepage-count match; urls-only
-  never reconciliation-complete; enrichment fetch failures incomplete; longest full
-  state-name match; state abbrev is the final pre-ZIP token; filler phrases share
-  the name punctuation pipeline; listing/sitemap provenance merged independently.
-- Test suite on this branch: **81 passed**, fixture-based, no network required for
+- Latest Branch 2 fixes:
+  1. `has_usable_location()` requires state, street, and a nonempty normalized house
+     number (via `normalize_street`), so PO boxes / non-numbered streets cannot mark
+     a scrape reconciliation-complete.
+  2. Unit stripping accepts an optional period after designators (`Apt.`, `Ste.`,
+     `Suite.`) so punctuated units do not leak into normalized streets.
+  3. Prior: location-less pages are enrichment failures; public scrape uses
+     `load_local_paths()` without CRM token; matching re-ranks live candidates;
+     urls-only never complete; filler phrases share the name punctuation pipeline.
+- Test suite on this branch: **83 passed**, fixture-based, no network required for
   scraper/matcher tests.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; do not treat a failed live
   scrape as a product bug.

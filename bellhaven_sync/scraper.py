@@ -21,6 +21,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from .config import DEFAULT_TIMEOUT, load_local_paths
+from .normalize import normalize_street
 
 logger = logging.getLogger(__name__)
 
@@ -298,11 +299,16 @@ def parse_facility_page(html: str, url: str) -> Facility:
 def has_usable_location(facility: Facility) -> bool:
     """True when a facility has the minimum evidence matching requires.
 
-    The matcher hard-gates on state. Without a parseable state (and at least a
-    street for address tiers), the record cannot participate safely in
-    reconciliation even if the HTTP fetch succeeded.
+    All three match tiers need a nonempty normalized house number plus state.
+    A PO box or non-numbered street can have state/street text and still be
+    impossible for match_facilities() to score, so those are not usable.
     """
-    return bool((facility.state or "").strip()) and bool((facility.street or "").strip())
+    if not (facility.state or "").strip():
+        return False
+    if not (facility.street or "").strip():
+        return False
+    house_number, _street = normalize_street(facility.street)
+    return bool(house_number)
 
 
 def default_fetcher(data_dir: Path | None = None) -> Fetcher:
@@ -388,9 +394,10 @@ def scrape_bellhaven(
                 html = do_fetch(url)
                 facility = parse_facility_page(html, url)
                 if not has_usable_location(facility):
+                    house, _ = normalize_street(facility.street)
                     raise ScrapeError(
                         f"no usable location evidence (state={facility.state!r}, "
-                        f"street={facility.street!r})"
+                        f"street={facility.street!r}, house_number={house!r})"
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("could not enrich facility page %s: %s", url, exc)
