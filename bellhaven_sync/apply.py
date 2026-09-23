@@ -467,6 +467,8 @@ def _patch_existing(
         attempt_id=attempt_id,
     )
     live = _require_account(str(proposal.account_id), session, settings)
+    if _uncertain_patch_already_applied(store, proposal, live, body):
+        return
     _require_fresh(proposal.current_values, live)
     _patch(session, settings, str(proposal.account_id), body)
 
@@ -488,6 +490,8 @@ def _apply_reparent(
     )
     _require_account(target_parent, session, settings)
     live = _require_account(str(proposal.account_id), session, settings)
+    if store.has_uncertain_attempt(proposal.id) and _same(live.get(fields.PARENT_ID), target_parent):
+        return
     _require_fresh(proposal.current_values, live)
     decision = chow.decide_parent_change(live, target_parent_id=target_parent)
     if decision.kind != chow.KIND_REPARENT:
@@ -496,6 +500,20 @@ def _apply_reparent(
             f"(decision is now {decision.kind!r}). No PATCH. Run sync and review again."
         )
     _patch(session, settings, str(proposal.account_id), {fields.PARENT_ID: target_parent})
+
+
+def _uncertain_patch_already_applied(
+    store: ProposalStore,
+    proposal: StoredProposal,
+    live: dict[str, Any],
+    body: dict[str, Any],
+) -> bool:
+    """True when a prior uncertain PATCH for this proposal already matches live state."""
+    if not store.has_uncertain_attempt(proposal.id):
+        return False
+    if not body:
+        return False
+    return all(_same(expected, live.get(key)) for key, expected in body.items())
 
 
 def _create_account(

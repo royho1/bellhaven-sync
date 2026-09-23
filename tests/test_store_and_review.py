@@ -287,3 +287,111 @@ def test_serve_rejects_non_loopback_hosts(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "loopback" in captured.err.lower()
     assert "0.0.0.0" in captured.err
+
+
+def test_legacy_create_identity_locks_migrate_before_structured_index(tmp_path):
+    """Existing DBs with opaque identity_key locks must initialize without OperationalError."""
+    import sqlite3
+
+    db_path = tmp_path / "legacy.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE reconciliation_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            scrape_complete INTEGER NOT NULL DEFAULT 0,
+            parent_account_id TEXT,
+            blockers_json TEXT NOT NULL DEFAULT '[]',
+            summary_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            action_type TEXT NOT NULL,
+            account_id TEXT,
+            facility_url TEXT,
+            current_values_json TEXT NOT NULL,
+            proposed_values_json TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            requires_review INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (run_id) REFERENCES reconciliation_runs(id)
+        );
+        CREATE TABLE application_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_id INTEGER NOT NULL,
+            run_id INTEGER NOT NULL,
+            action_type TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            state TEXT NOT NULL,
+            created_account_id TEXT,
+            error_text TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            FOREIGN KEY (proposal_id) REFERENCES proposals(id)
+        );
+        CREATE TABLE create_identity_locks (
+            identity_key TEXT PRIMARY KEY,
+            proposal_id INTEGER NOT NULL,
+            attempt_id INTEGER NOT NULL,
+            claimed_at TEXT NOT NULL,
+            FOREIGN KEY (proposal_id) REFERENCES proposals(id),
+            FOREIGN KEY (attempt_id) REFERENCES application_attempts(id)
+        );
+        INSERT INTO reconciliation_runs (
+            started_at, finished_at, scrape_complete, parent_account_id,
+            blockers_json, summary_json
+        ) VALUES (
+            '2026-01-01T00:00:00+00:00', '2026-01-01T00:01:00+00:00', 1, 'PARENT',
+            '[]', '{}'
+        );
+        INSERT INTO proposals (
+            run_id, action_type, account_id, facility_url,
+            current_values_json, proposed_values_json, evidence_json,
+            confidence, requires_review, status, created_at, updated_at
+        ) VALUES (
+            1, 'update_fields', 'A1', 'https://example.test/a',
+            '{"phone":"1"}', '{"phone":"2"}', '{"reason":"legacy"}',
+            'high', 1, 'approved',
+            '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = ProposalStore(db_path)
+
+    with store.connect() as conn:
+        cols = {str(row["name"]) for row in conn.execute("PRAGMA table_info(create_identity_locks)")}
+        indexes = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA index_list(create_identity_locks)").fetchall()
+        }
+        proposal = conn.execute(
+            "SELECT status, evidence_json FROM proposals WHERE id = 1"
+        ).fetchone()
+        runs = conn.execute("SELECT COUNT(*) AS n FROM reconciliation_runs").fetchone()
+
+    assert "identity_key" not in cols
+    assert {
+        "parent_id",
+        "name_norm",
+        "street_norm",
+        "state_norm",
+        "city_norm",
+        "zip_norm",
+        "proposal_id",
+        "attempt_id",
+        "claimed_at",
+    } <= cols
+    assert "idx_create_identity_locks_core" in indexes
+    assert proposal is not None
+    assert proposal["status"] == "approved"
+    assert "legacy" in proposal["evidence_json"]
+    assert int(runs["n"]) == 1

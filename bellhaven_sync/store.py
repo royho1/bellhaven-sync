@@ -68,6 +68,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_application_attempts_one_execute_in_progre
     ON application_attempts(proposal_id)
     WHERE mode = 'execute' AND state = 'in_progress';
 
+CREATE TABLE IF NOT EXISTS account_write_locks (
+    account_id TEXT PRIMARY KEY,
+    proposal_id INTEGER NOT NULL,
+    attempt_id INTEGER NOT NULL,
+    claimed_at TEXT NOT NULL,
+    FOREIGN KEY (proposal_id) REFERENCES proposals(id),
+    FOREIGN KEY (attempt_id) REFERENCES application_attempts(id)
+);
+"""
+
+# Applied only after legacy create_identity_locks tables are migrated/dropped.
+CREATE_IDENTITY_LOCKS_SQL = """
 CREATE TABLE IF NOT EXISTS create_identity_locks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     parent_id TEXT NOT NULL,
@@ -85,15 +97,6 @@ CREATE TABLE IF NOT EXISTS create_identity_locks (
 
 CREATE INDEX IF NOT EXISTS idx_create_identity_locks_core
     ON create_identity_locks(parent_id, name_norm, street_norm, state_norm);
-
-CREATE TABLE IF NOT EXISTS account_write_locks (
-    account_id TEXT PRIMARY KEY,
-    proposal_id INTEGER NOT NULL,
-    attempt_id INTEGER NOT NULL,
-    claimed_at TEXT NOT NULL,
-    FOREIGN KEY (proposal_id) REFERENCES proposals(id),
-    FOREIGN KEY (attempt_id) REFERENCES application_attempts(id)
-);
 """
 
 
@@ -229,12 +232,15 @@ class ProposalStore:
 
     def init_db(self) -> None:
         with self.connect() as conn:
+            # Base schema first (safe against legacy DBs). Create-identity locks and
+            # their structured-column index are applied only after migration.
             conn.executescript(SCHEMA_SQL)
             self._migrate_lock_tables(conn)
+            conn.executescript(CREATE_IDENTITY_LOCKS_SQL)
             conn.commit()
 
     def _migrate_lock_tables(self, conn: sqlite3.Connection) -> None:
-        """Rebuild create_identity_locks when an older opaque-key schema is present."""
+        """Drop a legacy opaque-key create_identity_locks table before structured DDL."""
         cols = {
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(create_identity_locks)").fetchall()
@@ -243,26 +249,6 @@ class ProposalStore:
             return
         if "identity_key" in cols or "name_norm" not in cols:
             conn.execute("DROP TABLE IF EXISTS create_identity_locks")
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS create_identity_locks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    parent_id TEXT NOT NULL,
-                    name_norm TEXT NOT NULL,
-                    street_norm TEXT NOT NULL,
-                    state_norm TEXT NOT NULL,
-                    city_norm TEXT,
-                    zip_norm TEXT,
-                    proposal_id INTEGER NOT NULL,
-                    attempt_id INTEGER NOT NULL,
-                    claimed_at TEXT NOT NULL,
-                    FOREIGN KEY (proposal_id) REFERENCES proposals(id),
-                    FOREIGN KEY (attempt_id) REFERENCES application_attempts(id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_create_identity_locks_core
-                    ON create_identity_locks(parent_id, name_norm, street_norm, state_norm);
-                """
-            )
 
     def save_run(self, batch: ProposalBatch, *, started_at: str | None = None) -> int:
         """Persist a new reconciliation run and its proposals. Never mutates old rows."""

@@ -2246,3 +2246,71 @@ def test_chow_reconcile_releases_locks_only_on_applied(settings, tmp_path):
     assert second.applied == 1
     assert not store.has_create_identity_lock_for_proposal(stored.id)
     assert not store.has_account_write_lock_for_proposal(stored.id)
+
+
+def test_uncertain_update_patch_reconciles_when_live_already_matches(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1"), "PARENT": _parent()})
+    session.lose_patch_response = 1
+    stored = _approve(store, _update_proposal(**{fields.PHONE: "419-555-9999"}))
+
+    first = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert first.failed == 1
+    assert store.list_attempts(stored.id)[-1].state == STATE_UNCERTAIN
+    assert len(session.patches) == 1
+    assert session.accounts["C1"][fields.PHONE] == "419-555-9999"
+    assert store.has_account_write_lock_for_proposal(stored.id)
+
+    second = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert second.applied == 1
+    assert len(session.patches) == 1
+    assert store.successful_attempt(stored.id) is not None
+    assert not store.has_account_write_lock_for_proposal(stored.id)
+
+
+def test_uncertain_reparent_patch_reconciles_when_live_already_has_target(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake(
+        {
+            "C1": _account("C1", **{fields.PARENT_ID: "OLD", fields.LIFETIME_REVENUE: 0, fields.OUTSTANDING_AR: 0}),
+            "PARENT": _parent(),
+            "OLD": _account("OLD"),
+        }
+    )
+    session.lose_patch_response = 1
+    stored = _approve(store, _reparent_proposal())
+
+    first = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert first.failed == 1
+    assert store.list_attempts(stored.id)[-1].state == STATE_UNCERTAIN
+    assert len(session.patches) == 1
+    assert session.accounts["C1"][fields.PARENT_ID] == "PARENT"
+    assert store.has_account_write_lock_for_proposal(stored.id)
+
+    second = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert second.applied == 1
+    assert len(session.patches) == 1
+    assert store.successful_attempt(stored.id) is not None
+    assert not store.has_account_write_lock_for_proposal(stored.id)
+
+
+def test_uncertain_update_does_not_reconcile_when_live_differs_from_intended(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1"), "PARENT": _parent()})
+    session.lose_patch_response = 1
+    stored = _approve(store, _update_proposal(**{fields.PHONE: "419-555-9999"}))
+
+    first = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert first.failed == 1
+    assert len(session.patches) == 1
+    # Live drifted to a third value that is neither reviewed-old nor intended.
+    session.accounts["C1"][fields.PHONE] = "419-555-0000"
+
+    second = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert second.applied == 0
+    assert second.blocked == 1
+    assert len(session.patches) == 1
+    assert store.successful_attempt(stored.id) is None
+    assert "CRM changed since this proposal was reviewed" in (
+        store.list_attempts(stored.id)[-1].error_text or ""
+    )
