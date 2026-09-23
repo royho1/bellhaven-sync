@@ -51,6 +51,23 @@ def test_pagination_stops_on_empty_page(settings):
     assert len(session.calls) == 2
 
 
+def test_pagination_raises_when_max_pages_exhausted_without_terminal_page(settings, monkeypatch):
+    monkeypatch.setattr(crm_client, "MAX_PAGES", 3)
+    page_size = 2
+    session = FakeSession(
+        [
+            FakeResponse({"items": [account(page * 10 + i) for i in range(page_size)]})
+            for page in range(1, 4)
+        ]
+    )
+
+    with pytest.raises(crm_client.CrmError) as exc:
+        list(crm_client.iter_accounts(page_size=page_size, session=session, settings=settings))
+
+    assert "pagination did not complete" in str(exc.value).lower()
+    assert len(session.calls) == 3
+
+
 def test_pagination_handles_a_bare_list_envelope(settings):
     session = FakeSession([FakeResponse([account(1)])])
 

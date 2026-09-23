@@ -364,6 +364,10 @@ def test_reparent_still_allows_field_updates():
     updates = [p for p in batch.proposals if p.action_type == ACTION_UPDATE_FIELDS]
     assert len(updates) == 1
     assert updates[0].proposed_values[fields.PHONE] == "419-555-9999"
+    reparent = next(p for p in batch.proposals if p.action_type == ACTION_REPARENT)
+    assert reparent.current_values[fields.LIFETIME_REVENUE] == 100
+    assert reparent.current_values[fields.OUTSTANDING_AR] == 0
+    assert reparent.current_values[fields.PARENT_ID] == "WRONG"
 
 
 def test_unresolved_chow_suppresses_field_updates_until_review():

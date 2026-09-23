@@ -13,7 +13,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .proposals import STATUS_VALUES, Proposal, ProposalBatch
+from .proposals import (
+    ACTION_CHOW,
+    ACTION_CREATE_ACCOUNT,
+    STATUS_APPROVED,
+    STATUS_VALUES,
+    Proposal,
+    ProposalBatch,
+)
+from . import fields
+from .normalize import (
+    normalize_city,
+    normalize_name,
+    normalize_state,
+    normalize_street,
+    normalize_zip,
+)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS reconciliation_runs (
@@ -46,6 +61,57 @@ CREATE TABLE IF NOT EXISTS proposals (
 CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
 CREATE INDEX IF NOT EXISTS idx_proposals_action ON proposals(action_type);
 CREATE INDEX IF NOT EXISTS idx_proposals_run ON proposals(run_id);
+
+CREATE TABLE IF NOT EXISTS application_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id INTEGER NOT NULL,
+    run_id INTEGER NOT NULL,
+    action_type TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_account_id TEXT,
+    error_text TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    FOREIGN KEY (proposal_id) REFERENCES proposals(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_application_attempts_proposal
+    ON application_attempts(proposal_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_application_attempts_one_execute_in_progress
+    ON application_attempts(proposal_id)
+    WHERE mode = 'execute' AND state = 'in_progress';
+
+CREATE TABLE IF NOT EXISTS account_write_locks (
+    account_id TEXT PRIMARY KEY,
+    proposal_id INTEGER NOT NULL,
+    attempt_id INTEGER NOT NULL,
+    claimed_at TEXT NOT NULL,
+    FOREIGN KEY (proposal_id) REFERENCES proposals(id),
+    FOREIGN KEY (attempt_id) REFERENCES application_attempts(id)
+);
+"""
+
+# Applied only after legacy create_identity_locks tables are migrated/dropped.
+CREATE_IDENTITY_LOCKS_SQL = """
+CREATE TABLE IF NOT EXISTS create_identity_locks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_id TEXT NOT NULL,
+    name_norm TEXT NOT NULL,
+    street_norm TEXT NOT NULL,
+    state_norm TEXT NOT NULL,
+    city_norm TEXT,
+    zip_norm TEXT,
+    proposal_id INTEGER NOT NULL,
+    attempt_id INTEGER NOT NULL,
+    claimed_at TEXT NOT NULL,
+    FOREIGN KEY (proposal_id) REFERENCES proposals(id),
+    FOREIGN KEY (attempt_id) REFERENCES application_attempts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_create_identity_locks_core
+    ON create_identity_locks(parent_id, name_norm, street_norm, state_norm);
 """
 
 
@@ -61,6 +127,180 @@ def _loads(raw: str | None) -> Any:
     if not raw:
         return {}
     return json.loads(raw)
+
+
+MODE_DRY_RUN = "dry_run"
+MODE_EXECUTE = "execute"
+STATE_PLANNED = "planned"
+STATE_IN_PROGRESS = "in_progress"
+STATE_APPLIED = "applied"
+STATE_BLOCKED = "blocked"
+STATE_FAILED = "failed"
+STATE_UNCERTAIN = "uncertain"
+
+CLAIM_CLAIMED = "claimed"
+CLAIM_ALREADY_APPLIED = "already_applied"
+CLAIM_IN_PROGRESS = "in_progress"
+CLAIM_NOT_APPROVED = "not_approved"
+
+# Leave write reservations in place for uncertain outcomes; release only when safe.
+# Blocked/failed release only reservations owned by *this* attempt_id so an older
+# uncertain attempt's lock is not dropped by a later same-proposal retry.
+_WRITE_LOCK_RELEASE_STATES = frozenset({STATE_BLOCKED, STATE_FAILED})
+
+ATTEMPT_MODES = frozenset({MODE_DRY_RUN, MODE_EXECUTE})
+ATTEMPT_STATES = frozenset(
+    {
+        STATE_PLANNED,
+        STATE_IN_PROGRESS,
+        STATE_APPLIED,
+        STATE_BLOCKED,
+        STATE_FAILED,
+        STATE_UNCERTAIN,
+    }
+)
+
+
+@dataclass(frozen=True)
+class ClaimResult:
+    status: str
+    attempt: ApplicationAttempt | None = None
+
+
+@dataclass(frozen=True)
+class CreateIdentityParts:
+    """Structured canonical create identity for overlap-aware reservations."""
+
+    parent_id: str
+    name_norm: str
+    street_norm: str
+    state_norm: str
+    city_norm: str | None = None
+    zip_norm: str | None = None
+
+    def overlaps(self, other: CreateIdentityParts) -> bool:
+        """True when two reservations must not both be held.
+
+        Same core identity conflicts unless optional city/ZIP evidence on both
+        sides positively proves the facilities are different.
+        """
+        if (
+            self.parent_id != other.parent_id
+            or self.name_norm != other.name_norm
+            or self.street_norm != other.street_norm
+            or self.state_norm != other.state_norm
+        ):
+            return False
+        if self.city_norm and other.city_norm and self.city_norm != other.city_norm:
+            return False
+        if self.zip_norm and other.zip_norm and self.zip_norm != other.zip_norm:
+            return False
+        return True
+
+
+class CreateIdentityError(ValueError):
+    """Approved create/CHOW body cannot form a safe identity reservation."""
+
+
+def _evidence_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def _canonical_identity_value(key: str, value: Any) -> str | None:
+    if _evidence_text(value) is None:
+        return None
+    raw = str(value)
+    if key == fields.NAME:
+        canon = normalize_name(raw)
+    elif key == fields.STREET:
+        house, street = normalize_street(raw)
+        canon = f"{house} {street}".strip()
+    elif key == fields.CITY:
+        canon = normalize_city(raw)
+    elif key == fields.STATE:
+        canon = normalize_state(raw)
+    elif key == fields.ZIP:
+        canon = normalize_zip(raw)
+    else:
+        canon = raw.strip()
+    return canon if canon else None
+
+
+_CREATE_LOCK_CORE_FIELDS = (fields.NAME, fields.STREET, fields.STATE)
+
+
+def create_identity_parts_from_body(body: dict[str, Any]) -> CreateIdentityParts:
+    """Canonical structured create identity for overlap-aware reservations."""
+    parent = str(body.get(fields.PARENT_ID) or "").strip()
+    if not parent:
+        raise CreateIdentityError(
+            "Cannot form a safe create identity lock from the approved create body "
+            "(missing parent_id)."
+        )
+    core: dict[str, str] = {}
+    for key in _CREATE_LOCK_CORE_FIELDS:
+        value = _canonical_identity_value(key, body.get(key))
+        if value is None:
+            raise CreateIdentityError(
+                "Cannot form a safe create identity lock from the approved create body "
+                f"(missing usable {key})."
+            )
+        core[key] = value
+    return CreateIdentityParts(
+        parent_id=parent,
+        name_norm=core[fields.NAME],
+        street_norm=core[fields.STREET],
+        state_norm=core[fields.STATE],
+        city_norm=_canonical_identity_value(fields.CITY, body.get(fields.CITY)),
+        zip_norm=_canonical_identity_value(fields.ZIP, body.get(fields.ZIP)),
+    )
+
+
+def create_body_from_proposal_record(action_type: str, proposed_values: dict[str, Any]) -> dict[str, Any]:
+    """Build the create-identity body from a persisted proposal's approved values."""
+    if action_type == ACTION_CREATE_ACCOUNT:
+        body = dict(proposed_values)
+        body[fields.CREATED_BY_CANDIDATE] = True
+        return body
+    if action_type == ACTION_CHOW:
+        template = proposed_values.get("new_account_template")
+        parent = proposed_values.get("new_account_parent_id")
+        if not isinstance(template, dict) or not parent:
+            raise CreateIdentityError(
+                "CHOW proposal is missing new_account_template or new_account_parent_id."
+            )
+        body = dict(template)
+        body[fields.PARENT_ID] = parent
+        body[fields.CREATED_BY_CANDIDATE] = True
+        return body
+    raise CreateIdentityError(
+        f"Unsupported action_type {action_type!r} for create-identity reconstruction."
+    )
+
+
+@dataclass(frozen=True)
+class _PreservedCreateLock:
+    identity: CreateIdentityParts
+    proposal_id: int
+    attempt_id: int
+    claimed_at: str
+
+
+@dataclass(frozen=True)
+class ApplicationAttempt:
+    id: int
+    proposal_id: int
+    run_id: int
+    action_type: str
+    mode: str
+    state: str
+    created_account_id: str | None
+    error_text: str | None
+    started_at: str
+    finished_at: str | None
 
 
 @dataclass(frozen=True)
@@ -98,7 +338,103 @@ class ProposalStore:
 
     def init_db(self) -> None:
         with self.connect() as conn:
+            # Base schema first (safe against legacy DBs). Create-identity locks and
+            # their structured-column index are applied only after migration.
             conn.executescript(SCHEMA_SQL)
+            self._ensure_create_identity_locks(conn)
+            conn.commit()
+
+    def _ensure_create_identity_locks(self, conn: sqlite3.Connection) -> None:
+        """Migrate legacy opaque locks, then create structured table/index."""
+        preserved = self._migrate_lock_tables(conn)
+        conn.executescript(CREATE_IDENTITY_LOCKS_SQL)
+        for row in preserved:
+            conn.execute(
+                """
+                INSERT INTO create_identity_locks (
+                    parent_id, name_norm, street_norm, state_norm, city_norm, zip_norm,
+                    proposal_id, attempt_id, claimed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row.identity.parent_id,
+                    row.identity.name_norm,
+                    row.identity.street_norm,
+                    row.identity.state_norm,
+                    row.identity.city_norm,
+                    row.identity.zip_norm,
+                    row.proposal_id,
+                    row.attempt_id,
+                    row.claimed_at,
+                ),
+            )
+
+    def _migrate_lock_tables(self, conn: sqlite3.Connection) -> list[_PreservedCreateLock]:
+        """Drop a legacy opaque-key table, preserving unresolved reservations."""
+        cols = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(create_identity_locks)").fetchall()
+        }
+        if not cols:
+            return []
+        if "identity_key" not in cols and "name_norm" in cols:
+            return []
+
+        legacy_rows = conn.execute(
+            """
+            SELECT identity_key, proposal_id, attempt_id, claimed_at
+            FROM create_identity_locks
+            """
+        ).fetchall()
+        preserved: list[_PreservedCreateLock] = []
+        for row in legacy_rows:
+            proposal_id = int(row["proposal_id"])
+            attempt_id = int(row["attempt_id"])
+            attempt = conn.execute(
+                "SELECT state FROM application_attempts WHERE id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if attempt is None:
+                raise RuntimeError(
+                    f"Cannot migrate create-identity lock for proposal {proposal_id}: "
+                    f"application attempt {attempt_id} is missing. "
+                    "Refusing to discard an unresolved reservation."
+                )
+            state = str(attempt["state"])
+            if state not in {STATE_IN_PROGRESS, STATE_UNCERTAIN}:
+                continue
+            proposal = conn.execute(
+                "SELECT action_type, proposed_values_json FROM proposals WHERE id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if proposal is None:
+                raise RuntimeError(
+                    f"Cannot migrate create-identity lock for proposal {proposal_id}: "
+                    "proposal row is missing. Refusing to discard an unresolved reservation."
+                )
+            try:
+                proposed = _loads(str(proposal["proposed_values_json"]))
+                if not isinstance(proposed, dict):
+                    raise CreateIdentityError("proposed_values is not an object")
+                body = create_body_from_proposal_record(str(proposal["action_type"]), proposed)
+                identity = create_identity_parts_from_body(body)
+            except (CreateIdentityError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"Cannot migrate unresolved create-identity lock for proposal {proposal_id} "
+                    f"attempt {attempt_id} (state={state}): {exc}. "
+                    "Refusing to discard an active reservation."
+                ) from exc
+            preserved.append(
+                _PreservedCreateLock(
+                    identity=identity,
+                    proposal_id=proposal_id,
+                    attempt_id=attempt_id,
+                    claimed_at=str(row["claimed_at"]),
+                )
+            )
+
+        conn.execute("DROP TABLE IF EXISTS create_identity_locks")
+        return preserved
 
     def save_run(self, batch: ProposalBatch, *, started_at: str | None = None) -> int:
         """Persist a new reconciliation run and its proposals. Never mutates old rows."""
@@ -224,6 +560,454 @@ class ProposalStore:
             for row in rows
         ]
 
+    def record_attempt(
+        self,
+        *,
+        proposal_id: int,
+        run_id: int,
+        action_type: str,
+        mode: str,
+        state: str,
+        created_account_id: str | None = None,
+        error_text: str | None = None,
+    ) -> ApplicationAttempt:
+        if mode not in ATTEMPT_MODES:
+            raise ValueError(f"invalid application mode {mode!r}")
+        if state not in ATTEMPT_STATES:
+            raise ValueError(f"invalid application state {state!r}")
+        started = _now()
+        finished = started if state != STATE_IN_PROGRESS else None
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO application_attempts (
+                    proposal_id, run_id, action_type, mode, state,
+                    created_account_id, error_text, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proposal_id,
+                    run_id,
+                    action_type,
+                    mode,
+                    state,
+                    created_account_id,
+                    error_text,
+                    started,
+                    finished,
+                ),
+            )
+            attempt_id = int(cur.lastrowid)
+            conn.commit()
+        attempt = self.get_attempt(attempt_id)
+        assert attempt is not None
+        return attempt
+
+    def claim_execute_attempt(
+        self,
+        *,
+        proposal_id: int,
+        run_id: int,
+        action_type: str,
+    ) -> ClaimResult:
+        """Atomically claim a proposal for execute mode, or report why it cannot run.
+
+        Uses ``BEGIN IMMEDIATE`` so two processes cannot both insert ``in_progress``.
+        An existing ``in_progress`` row is never overwritten: it may already have
+        written to the CRM.
+        """
+        started = _now()
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            proposal_row = conn.execute(
+                "SELECT status FROM proposals WHERE id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if proposal_row is None or str(proposal_row["status"]) != STATUS_APPROVED:
+                conn.commit()
+                return ClaimResult(CLAIM_NOT_APPROVED, None)
+
+            applied = conn.execute(
+                """
+                SELECT * FROM application_attempts
+                WHERE proposal_id = ? AND mode = ? AND state = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (proposal_id, MODE_EXECUTE, STATE_APPLIED),
+            ).fetchone()
+            if applied is not None:
+                conn.commit()
+                return ClaimResult(CLAIM_ALREADY_APPLIED, self._row_to_attempt(applied))
+
+            busy = conn.execute(
+                """
+                SELECT * FROM application_attempts
+                WHERE proposal_id = ? AND mode = ? AND state = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (proposal_id, MODE_EXECUTE, STATE_IN_PROGRESS),
+            ).fetchone()
+            if busy is not None:
+                conn.commit()
+                return ClaimResult(CLAIM_IN_PROGRESS, self._row_to_attempt(busy))
+
+            cur = conn.execute(
+                """
+                INSERT INTO application_attempts (
+                    proposal_id, run_id, action_type, mode, state,
+                    created_account_id, error_text, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proposal_id,
+                    run_id,
+                    action_type,
+                    MODE_EXECUTE,
+                    STATE_IN_PROGRESS,
+                    None,
+                    None,
+                    started,
+                    None,
+                ),
+            )
+            attempt_id = int(cur.lastrowid)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        attempt = self.get_attempt(attempt_id)
+        assert attempt is not None
+        return ClaimResult(CLAIM_CLAIMED, attempt)
+
+    def claim_create_identity(
+        self,
+        *,
+        identity: CreateIdentityParts,
+        proposal_id: int,
+        attempt_id: int,
+    ) -> bool:
+        """Reserve a create identity across proposals using structured overlap rules.
+
+        Returns True if this proposal may proceed. The same proposal may continue
+        while an older uncertain attempt still owns the reservation; ownership is
+        not transferred onto the retry attempt. A different proposal cannot take
+        an overlapping lock while it is held.
+        """
+        if not (
+            identity.parent_id
+            and identity.name_norm
+            and identity.street_norm
+            and identity.state_norm
+        ):
+            raise ValueError("create identity core fields are required")
+        claimed_at = _now()
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT id, parent_id, name_norm, street_norm, state_norm,
+                       city_norm, zip_norm, proposal_id, attempt_id
+                FROM create_identity_locks
+                WHERE parent_id = ? AND name_norm = ? AND street_norm = ? AND state_norm = ?
+                """,
+                (
+                    identity.parent_id,
+                    identity.name_norm,
+                    identity.street_norm,
+                    identity.state_norm,
+                ),
+            ).fetchall()
+            for row in rows:
+                held = CreateIdentityParts(
+                    parent_id=str(row["parent_id"]),
+                    name_norm=str(row["name_norm"]),
+                    street_norm=str(row["street_norm"]),
+                    state_norm=str(row["state_norm"]),
+                    city_norm=str(row["city_norm"]) if row["city_norm"] else None,
+                    zip_norm=str(row["zip_norm"]) if row["zip_norm"] else None,
+                )
+                if not identity.overlaps(held):
+                    continue
+                holder_proposal = int(row["proposal_id"])
+                holder_attempt = int(row["attempt_id"])
+                if holder_attempt == attempt_id or holder_proposal == proposal_id:
+                    # Same proposal (or same attempt) may proceed; keep the original
+                    # uncertain attempt as lock owner so a blocked retry cannot drop it.
+                    conn.commit()
+                    return True
+                conn.commit()
+                return False
+            conn.execute(
+                """
+                INSERT INTO create_identity_locks (
+                    parent_id, name_norm, street_norm, state_norm, city_norm, zip_norm,
+                    proposal_id, attempt_id, claimed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    identity.parent_id,
+                    identity.name_norm,
+                    identity.street_norm,
+                    identity.state_norm,
+                    identity.city_norm,
+                    identity.zip_norm,
+                    proposal_id,
+                    attempt_id,
+                    claimed_at,
+                ),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def claim_account_write(
+        self,
+        *,
+        account_id: str,
+        proposal_id: int,
+        attempt_id: int,
+    ) -> bool:
+        """Reserve exclusive mutation of an existing CRM account across proposals.
+
+        Same-proposal retries may continue without transferring ownership away from
+        an older uncertain attempt. Different proposals fail closed.
+        """
+        account_id = str(account_id or "").strip()
+        if not account_id:
+            raise ValueError("account_id is required for account write reservation")
+        claimed_at = _now()
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT proposal_id, attempt_id FROM account_write_locks WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if row is not None:
+                holder_proposal = int(row["proposal_id"])
+                holder_attempt = int(row["attempt_id"])
+                if holder_attempt == attempt_id or holder_proposal == proposal_id:
+                    conn.commit()
+                    return True
+                conn.commit()
+                return False
+            conn.execute(
+                """
+                INSERT INTO account_write_locks (
+                    account_id, proposal_id, attempt_id, claimed_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (account_id, proposal_id, attempt_id, claimed_at),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def release_create_identity_for_attempt(self, attempt_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM create_identity_locks WHERE attempt_id = ?",
+                (attempt_id,),
+            )
+            conn.commit()
+
+    def release_create_identity_for_proposal(self, proposal_id: int) -> None:
+        """Drop any create-identity reservation held by attempts for this proposal."""
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM create_identity_locks WHERE proposal_id = ?",
+                (proposal_id,),
+            )
+            conn.commit()
+
+    def release_account_write_for_attempt(self, attempt_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM account_write_locks WHERE attempt_id = ?",
+                (attempt_id,),
+            )
+            conn.commit()
+
+    def release_account_write_for_proposal(self, proposal_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM account_write_locks WHERE proposal_id = ?",
+                (proposal_id,),
+            )
+            conn.commit()
+
+    def has_create_identity_lock_for_proposal(self, proposal_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM create_identity_locks WHERE proposal_id = ? LIMIT 1",
+                (proposal_id,),
+            ).fetchone()
+        return row is not None
+
+    def has_account_write_lock_for_proposal(self, proposal_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM account_write_locks WHERE proposal_id = ? LIMIT 1",
+                (proposal_id,),
+            ).fetchone()
+        return row is not None
+
+    def create_identity_lock_attempt_id(self, proposal_id: int) -> int | None:
+        """Attempt that currently owns the create-identity reservation, if any."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT attempt_id FROM create_identity_locks
+                WHERE proposal_id = ?
+                ORDER BY id
+                LIMIT 1
+                """,
+                (proposal_id,),
+            ).fetchone()
+        return int(row["attempt_id"]) if row is not None else None
+
+    def account_write_lock_attempt_id(self, account_id: str) -> int | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT attempt_id FROM account_write_locks WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+        return int(row["attempt_id"]) if row is not None else None
+
+    def update_attempt(
+        self,
+        attempt_id: int,
+        *,
+        state: str,
+        created_account_id: str | None = None,
+        error_text: str | None = None,
+    ) -> ApplicationAttempt:
+        if state not in ATTEMPT_STATES:
+            raise ValueError(f"invalid application state {state!r}")
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE application_attempts
+                SET state = ?,
+                    created_account_id = COALESCE(?, created_account_id),
+                    error_text = COALESCE(?, error_text),
+                    finished_at = ?
+                WHERE id = ?
+                """,
+                (state, created_account_id, error_text, _now(), attempt_id),
+            )
+            if cur.rowcount != 1:
+                raise KeyError(f"application attempt {attempt_id} not found")
+            if state == STATE_APPLIED:
+                owned = conn.execute(
+                    "SELECT proposal_id FROM application_attempts WHERE id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                if owned is not None:
+                    proposal_id = int(owned["proposal_id"])
+                    conn.execute(
+                        "DELETE FROM create_identity_locks WHERE proposal_id = ?",
+                        (proposal_id,),
+                    )
+                    conn.execute(
+                        "DELETE FROM account_write_locks WHERE proposal_id = ?",
+                        (proposal_id,),
+                    )
+            elif state in _WRITE_LOCK_RELEASE_STATES:
+                conn.execute(
+                    "DELETE FROM create_identity_locks WHERE attempt_id = ?",
+                    (attempt_id,),
+                )
+                conn.execute(
+                    "DELETE FROM account_write_locks WHERE attempt_id = ?",
+                    (attempt_id,),
+                )
+            conn.commit()
+        attempt = self.get_attempt(attempt_id)
+        assert attempt is not None
+        return attempt
+
+    def get_attempt(self, attempt_id: int) -> ApplicationAttempt | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM application_attempts WHERE id = ?",
+                (attempt_id,),
+            ).fetchone()
+        return self._row_to_attempt(row) if row else None
+
+    def list_attempts(self, proposal_id: int) -> list[ApplicationAttempt]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM application_attempts
+                WHERE proposal_id = ?
+                ORDER BY id
+                """,
+                (proposal_id,),
+            ).fetchall()
+        return [self._row_to_attempt(row) for row in rows]
+
+    def successful_attempt(self, proposal_id: int) -> ApplicationAttempt | None:
+        """An execute-mode attempt that finished applied. Dry-run plans do not count."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM application_attempts
+                WHERE proposal_id = ? AND mode = ? AND state = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (proposal_id, MODE_EXECUTE, STATE_APPLIED),
+            ).fetchone()
+        return self._row_to_attempt(row) if row else None
+
+    def created_account_id_for_proposal(self, proposal_id: int) -> str | None:
+        """Newest execute-mode account id, including a failed attempt after a successful POST."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT created_account_id FROM application_attempts
+                WHERE proposal_id = ?
+                  AND mode = ?
+                  AND created_account_id IS NOT NULL
+                  AND created_account_id != ''
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (proposal_id, MODE_EXECUTE),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["created_account_id"])
+
+    def has_uncertain_attempt(self, proposal_id: int) -> bool:
+        """True when an execute-mode attempt recorded an uncertain write outcome."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM application_attempts
+                WHERE proposal_id = ? AND mode = ? AND state = ?
+                LIMIT 1
+                """,
+                (proposal_id, MODE_EXECUTE, STATE_UNCERTAIN),
+            ).fetchone()
+        return row is not None
+
     def action_types(self, *, run_id: int | None = None) -> list[str]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -237,6 +1021,24 @@ class ProposalStore:
                 params,
             ).fetchall()
         return [str(row["action_type"]) for row in rows]
+
+    @staticmethod
+    def _row_to_attempt(row: sqlite3.Row) -> ApplicationAttempt:
+        created = row["created_account_id"]
+        error = row["error_text"]
+        finished = row["finished_at"]
+        return ApplicationAttempt(
+            id=int(row["id"]),
+            proposal_id=int(row["proposal_id"]),
+            run_id=int(row["run_id"]),
+            action_type=str(row["action_type"]),
+            mode=str(row["mode"]),
+            state=str(row["state"]),
+            created_account_id=str(created) if created else None,
+            error_text=str(error) if error else None,
+            started_at=str(row["started_at"]),
+            finished_at=str(finished) if finished else None,
+        )
 
     @staticmethod
     def _row_to_proposal(row: sqlite3.Row) -> StoredProposal:

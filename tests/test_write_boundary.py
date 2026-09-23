@@ -8,7 +8,6 @@ walks the transitive import graph rather than trusting convention.
 from __future__ import annotations
 
 import ast
-import importlib.util
 from pathlib import Path
 
 PACKAGE = "bellhaven_sync"
@@ -102,6 +101,41 @@ def test_crm_client_defines_no_write_capability():
     assert not ({"post", "patch", "put", "delete"} & called_methods)
 
 
-def test_the_package_currently_has_no_apply_module_on_this_branch():
-    # Phase 0 is strictly read-only; the writer arrives in feat/apply-and-schedule.
-    assert importlib.util.find_spec(APPLY_MODULE) is None
+def _http_write_calls(tree: ast.AST) -> set[str]:
+    """Session methods, not Flask route decorators such as @app.post."""
+    writers = {"post", "patch", "put", "delete"}
+    decorators: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            decorators.update(id(item) for item in node.decorator_list)
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if id(node) in decorators:
+            continue
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in writers:
+                found.add(node.func.attr)
+    return found
+
+
+def test_only_apply_py_issues_crm_writes():
+    package_dir = Path(__file__).resolve().parent.parent / PACKAGE
+    found_apply = False
+    for path in sorted(package_dir.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        used = _http_write_calls(tree)
+        if path.name == "apply.py":
+            found_apply = True
+            assert {"post", "patch"} <= used
+            assert not ({"put", "delete"} & used)
+        else:
+            assert not used, f"{path.name} calls {sorted(used)}"
+    assert found_apply
+
+
+def test_scheduled_sync_script_cannot_call_apply():
+    script = Path(__file__).resolve().parent.parent / "scripts" / "run_scheduled_sync.sh"
+    text = script.read_text(encoding="utf-8")
+    assert "bellhaven_sync.cli sync" in text
+    assert "apply_cli" not in text
+    assert "bellhaven_sync.apply" not in text

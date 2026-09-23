@@ -201,7 +201,10 @@ def iter_accounts(
             yield item
         if len(items) < page_size:
             return
-    logger.warning("Stopped paging after %s pages; the API may be ignoring the page parameter", seen_pages)
+    raise CrmError(
+        f"Account pagination did not complete after {MAX_PAGES} full pages "
+        f"(page_size={page_size}); refusing to treat the account list as complete."
+    )
 
 
 def get_account(

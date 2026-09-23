@@ -94,8 +94,10 @@ Four branches, each reviewed and merged before the next starts:
 
 - Branch 1 `feat/schema-discovery` is merged to `main`.
 - Branch 2 `feat/scrape-and-match` is merged to `main` via PR #2 (`4cf89e7`).
-- Branch 3 `feat/proposals-and-review` is open as [PR #3](https://github.com/royho1/bellhaven-sync/pull/3).
-  **Do not merge until Codex is clean. Do not start Branch 4 yet.**
+- Branch 3 `feat/proposals-and-review` is merged to `main` via PR #3 (`4c90c07`).
+- Branch 4 `feat/apply-and-schedule` is the final write path. Do not merge it
+  until the Codex review on this branch is clean. Do not run live `--execute`
+  against the assessment API.
 - Branch 3 decisions:
   1. Explicit proposal action types in `proposals.py` (update/reparent/CHOW/create/
      ambiguous/duplicate/stale/chow-review/inactive-review/care-type-review).
@@ -146,9 +148,63 @@ Four branches, each reviewed and merged before the next starts:
   14. `normalize_name()` stays lossy for matching. Proposal name comparison uses
      `normalize_name_for_comparison()`, which keeps qualifiers such as Memory
      Care, Assisted Living, and parenthetical words.
-- Test suite on this branch: **137 passed**, fixture-based, no network required.
+     15. Apply lives only in `apply.py`, reached through `python -m bellhaven_sync.apply_cli`.
+     `crm_client.py` stays GET-only. `cli sync` and `scripts/run_scheduled_sync.sh`
+     cannot import the write path. Writes require an approved writable proposal,
+     a fresh CRM preflight, `DRY_RUN=false`, and `--execute`. Review-only actions
+     never write. CHOW POSTs a new account, stores that id, then PATCHes the old
+     account with only `chow_current_account`. Application attempts are a separate
+     SQLite table and do not overwrite approval status.
+  16. Uncertain write outcomes (`ApplyError(uncertain=True)`) persist as attempt
+     state `uncertain`, not ordinary `failed`/`blocked`. That durable flag is how
+     resume knows a prior POST may have succeeded without an id.
+  17. Ordinary create and CHOW share the same pre-create scan. Neither issues a
+     second POST after an uncertain POST unless a unique tool-created account is
+     first recovered. With no persisted `created_account_id`: scan for exact
+     matches under the expected parent using approved identity/address evidence.
+     Matching non-tool accounts (`created_by_candidate` is not True) are CRM drift
+     and block both ordinary create and CHOW create (no adopt, no POST, no PATCH).
+     With no non-tool matches: exactly one tool-created match is recovered; more
+     than one stops for human review; zero matches with a prior uncertain attempt
+     refuse another POST fail-closed; zero matches with no prior uncertain attempt
+     may POST once.
+  18. Recovery-scan CRM read failures (`crm_client.CrmError` from
+     `_matching_accounts_for_create`) become `ApplyError` for the current proposal
+     only. The attempt ends blocked; later approved proposals in the same
+     `run_apply()` invocation are still considered. No POST/PATCH on an untrusted
+     scan.
+  19. Execute mode atomically claims a proposal in SQLite (`BEGIN IMMEDIATE` via
+     `claim_execute_attempt`) before any CRM write. A partial unique index allows
+     only one execute-mode `in_progress` attempt per proposal. Concurrent callers
+     and orphaned `in_progress` rows fail closed without a second POST/PATCH,
+     because a prior process may already have written to the CRM. No time-based
+     lock expiry and no silent claim takeover.
+  20. Create duplicate/recovery identity (`_same_identity`) uses stable name and
+     billing address fields only. Phone is ignored. Blank or whitespace-only
+     proposed address fields are skipped as unavailable evidence, so a missing
+     city/ZIP cannot reject an otherwise matching CRM account.
+  21. Create and CHOW create paths also take an atomic `create_identity_locks`
+     reservation (parent + canonical non-blank identity fields) while an attempt
+     is `in_progress` or `uncertain`, so two different proposal IDs for the same
+     facility cannot both POST. The same proposal may transfer the reservation
+     onto a newer attempt during uncertain recovery. The lock is released only on
+     applied/blocked/failed.
+  22. Create identity keys and `_same_identity` use `normalize_name` /
+     `normalize_street` / `normalize_city` / `normalize_state` / `normalize_zip`.
+  23. `claim_execute_attempt` re-reads proposal status under `BEGIN IMMEDIATE`
+     and refuses with `CLAIM_NOT_APPROVED` if the proposal is no longer approved.
+  24. ACTION_REPARENT re-runs `chow.decide_parent_change` on the live account
+     before PATCH; only `KIND_REPARENT` may proceed. New reparent proposals store
+     `lifetime_revenue` and `outstanding_ar` in `current_values`.
+  25. Uncertain create/CHOW recovery that still finds no account stays
+     `uncertain` (not blocked) so the identity lock is retained.
+  26. Create identity locks use parent + normalized name/street/state only.
+  27. Remembered CHOW successors are revalidated (parent + canonical identity)
+     before linking the old account.
+- Test suite on this branch: **179 passed**, fixture-based, no live POST/PATCH.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
-- Next after a clean merge of PR #3: `feat/apply-and-schedule`.
+- Real-world limit: execute mode is implemented and tested with fake sessions
+  only. It has not been run against the assessment API.
 
 ## Open questions
 

@@ -379,7 +379,11 @@ def generate_proposals(
                         action_type=ACTION_REPARENT,
                         account_id=account_id,
                         facility_url=facility.url,
-                        current_values={fields.PARENT_ID: current_parent},
+                        current_values={
+                            fields.PARENT_ID: current_parent,
+                            fields.LIFETIME_REVENUE: decision.lifetime_revenue,
+                            fields.OUTSTANDING_AR: decision.outstanding_ar,
+                        },
                         proposed_values={fields.PARENT_ID: parent.account_id},
                         evidence={
                             "chow_kind": decision.kind,
