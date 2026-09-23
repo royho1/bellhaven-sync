@@ -94,19 +94,24 @@ Four branches, each reviewed and merged before the next starts:
 
 - Branch 1 `feat/schema-discovery` is merged to `main`.
 - Branch 2 `feat/scrape-and-match` is merged to `main` via PR #2 (`4cf89e7`).
-- Branch 3 `feat/proposals-and-review` is in progress as PR #3.
+- Branch 3 `feat/proposals-and-review` is open as [PR #3](https://github.com/royho1/bellhaven-sync/pull/3).
   **Do not merge until Codex is clean. Do not start Branch 4 yet.**
 - Branch 3 decisions:
   1. Explicit proposal action types in `proposals.py` (update/reparent/CHOW/create/
      ambiguous/duplicate/stale/chow-review). No invented merge/delete/deactivate.
   2. `chow.py` isolates parent-change policy; zero revenue + positive AR is human
      review; revenue+AR uses two-step CHOW plan; otherwise direct re-parent.
-  3. SQLite `data/bellhaven_sync.db` stores runs + proposals; new runs insert rows
-     and never overwrite prior review status.
-  4. `cli sync` and `cli serve` are CRM-read-only; approve/reject only updates SQLite.
-  5. Incomplete scrape or unresolved parent suppresses create/stale/parent-move
+  3. Two-step CHOW suppresses `update_fields` on the old account; website values
+     live only in `new_account_template`, and the old account patch is solely
+     `chow_current_account`.
+  4. Ambiguous candidate account IDs are website-associated for stale detection
+     only (never auto-updated / re-parented).
+  5. SQLite `data/bellhaven_sync.db` stores runs + proposals; new runs insert rows
+     and never overwrite prior review status. Review UI defaults to the latest run.
+  6. `cli sync` and `cli serve` are CRM-read-only; approve/reject only updates SQLite.
+  7. Incomplete scrape or unresolved parent suppresses create/stale/parent-move
      proposals that depend on that certainty.
-- Test suite on this branch: **109 passed**, fixture-based, no network required.
+- Test suite on this branch: **113 passed**, fixture-based, no network required.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
 - Next after a clean merge of PR #3: `feat/apply-and-schedule`.
 
