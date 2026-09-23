@@ -134,6 +134,33 @@ def test_enrichment_failure_marks_scrape_incomplete():
     assert any("enrichment failed" in b.lower() for b in result.blockers)
 
 
+def test_page_without_location_evidence_is_enrichment_failure():
+    # HTTP-success-equivalent HTML with no parseable address must not count as
+    # a successfully enriched facility, even when the URL count matches the claim.
+    homepage = (FIXTURES / "homepage.html").read_text(encoding="utf-8").replace(
+        "35 communities", "5 communities"
+    )
+    no_address = (FIXTURES / "no-address.html").read_text(encoding="utf-8")
+    result = scraper.scrape_bellhaven(
+        base_url=BASE,
+        fetch=fixture_fetcher(
+            {
+                f"{BASE}/": homepage,
+                f"{BASE}/communities/bellhaven-of-tiffin": no_address,
+            }
+        ),
+        enrich_pages=True,
+    )
+    assert result.claimed_count == 5
+    assert result.facility_count == 5
+    assert result.complete is False
+    assert any("usable location evidence" in b for b in result.blockers)
+    tiffin = next(f for f in result.facilities if "tiffin" in f.url)
+    assert not scraper.has_usable_location(tiffin)
+    assert not tiffin.state
+    assert not tiffin.street
+
+
 def test_union_recovers_findlay_missing_from_listing():
     result = scraper.scrape_bellhaven(base_url=BASE, fetch=fixture_fetcher(), enrich_pages=True)
     urls = {f.url for f in result.facilities}

@@ -20,7 +20,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from .config import DEFAULT_TIMEOUT, Settings, load_settings
+from .config import DEFAULT_TIMEOUT, load_local_paths
 
 logger = logging.getLogger(__name__)
 
@@ -295,10 +295,23 @@ def parse_facility_page(html: str, url: str) -> Facility:
     )
 
 
-def default_fetcher(settings: Settings | None = None) -> Fetcher:
-    """HTTP fetcher that also caches responses under data/html/."""
-    resolved = settings or load_settings()
-    cache_dir = resolved.data_dir / "html"
+def has_usable_location(facility: Facility) -> bool:
+    """True when a facility has the minimum evidence matching requires.
+
+    The matcher hard-gates on state. Without a parseable state (and at least a
+    street for address tiers), the record cannot participate safely in
+    reconciliation even if the HTTP fetch succeeded.
+    """
+    return bool((facility.state or "").strip()) and bool((facility.street or "").strip())
+
+
+def default_fetcher(data_dir: Path | None = None) -> Fetcher:
+    """HTTP fetcher that also caches responses under data/html/.
+
+    Uses local path config only. Never loads CRM credentials.
+    """
+    root = data_dir if data_dir is not None else load_local_paths().data_dir
+    cache_dir = root / "html"
     cache_dir.mkdir(parents=True, exist_ok=True)
     session = requests.Session()
     session.headers.update(
@@ -320,12 +333,16 @@ def scrape_bellhaven(
     *,
     base_url: str = DEFAULT_SITE_BASE,
     fetch: Fetcher | None = None,
-    settings: Settings | None = None,
+    data_dir: Path | None = None,
     enrich_pages: bool = True,
 ) -> ScrapeResult:
-    """Scrape the site. `fetch` is injectable so tests never touch the network."""
+    """Scrape the site. `fetch` is injectable so tests never touch the network.
+
+    Does not require CRM credentials. Pass `data_dir` (or rely on
+    BELLHAVEN_DATA_DIR / the default) only when using the default HTTP fetcher.
+    """
     base = base_url.rstrip("/")
-    do_fetch = fetch or default_fetcher(settings)
+    do_fetch = fetch or default_fetcher(data_dir)
 
     homepage_html = do_fetch(f"{base}/")
     listing_html = do_fetch(f"{base}/communities")
@@ -370,8 +387,13 @@ def scrape_bellhaven(
             try:
                 html = do_fetch(url)
                 facility = parse_facility_page(html, url)
+                if not has_usable_location(facility):
+                    raise ScrapeError(
+                        f"no usable location evidence (state={facility.state!r}, "
+                        f"street={facility.street!r})"
+                    )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("could not parse facility page %s: %s", url, exc)
+                logger.warning("could not enrich facility page %s: %s", url, exc)
                 facility = Facility(name=_slug_to_name(url), url=url)
                 enrichment_failures.append(url)
         else:
@@ -398,8 +420,9 @@ def scrape_bellhaven(
         complete = False
         blockers.append(
             f"Facility enrichment failed for {len(enrichment_failures)} URL(s); "
-            "those records lack address evidence. Suppressing missing-on-site "
-            "proposals until enrichment succeeds."
+            "those records lack usable location evidence (state/street) required "
+            "for matching. Suppressing missing-on-site proposals until enrichment "
+            "succeeds."
         )
     if not enrich_pages:
         complete = False

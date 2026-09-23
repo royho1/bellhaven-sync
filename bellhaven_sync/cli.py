@@ -37,15 +37,17 @@ def cmd_scrape(args: argparse.Namespace) -> int:
     from datetime import datetime, timezone
 
     from . import scraper
+    from .config import load_local_paths
 
-    settings = load_settings()
+    # Public-site scrape never talks to the CRM and must not require a token.
+    paths = load_local_paths()
     result = scraper.scrape_bellhaven(
         base_url=args.base_url,
-        settings=settings,
+        data_dir=paths.data_dir,
         enrich_pages=not args.urls_only,
     )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out = settings.data_dir / "scrapes" / f"facilities-{stamp}.json"
+    out = paths.scrape_dir / f"facilities-{stamp}.json"
     scraper.save_facilities(result, out)
 
     print(f"Claimed on homepage: {result.claimed_count}")
