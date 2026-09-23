@@ -51,6 +51,9 @@ class CrmFake:
         self.lose_post_response = 0
         self.lose_patch_response = 0
         self.list_error: Exception | None = None
+        self.write_status_code = 200
+        self.write_response_payload: Any | None = None
+        self.write_response_text: str | None = None
         self._seq = 1
 
     def get(self, url: str, params: dict[str, Any] | None = None, timeout: Any = None) -> FakeResponse:
@@ -78,7 +81,12 @@ class CrmFake:
         if self.lose_post_response:
             self.lose_post_response -= 1
             raise requests.Timeout(f"post response lost {FAKE_TOKEN}")
-        return FakeResponse(created)
+        payload = self.write_response_payload if self.write_response_payload is not None else created
+        return FakeResponse(
+            payload,
+            status_code=self.write_status_code,
+            text=self.write_response_text if self.write_response_text is not None else "",
+        )
 
     def patch(self, url: str, json: dict[str, Any] | None = None, timeout: Any = None) -> FakeResponse:
         body = dict(json or {})
@@ -91,7 +99,16 @@ class CrmFake:
         if self.lose_patch_response:
             self.lose_patch_response -= 1
             raise requests.Timeout(f"patch response lost {FAKE_TOKEN}")
-        return FakeResponse(self.accounts[account_id])
+        payload = (
+            self.write_response_payload
+            if self.write_response_payload is not None
+            else self.accounts[account_id]
+        )
+        return FakeResponse(
+            payload,
+            status_code=self.write_status_code,
+            text=self.write_response_text if self.write_response_text is not None else "",
+        )
 
 
 def _batch(*proposals: Proposal) -> ProposalBatch:
@@ -2314,3 +2331,91 @@ def test_uncertain_update_does_not_reconcile_when_live_differs_from_intended(set
     assert "CRM changed since this proposal was reviewed" in (
         store.list_attempts(stored.id)[-1].error_text or ""
     )
+
+
+def test_create_blocked_when_account_scan_hits_max_pages(settings, tmp_path, monkeypatch):
+    from bellhaven_sync import crm_client
+
+    monkeypatch.setattr(crm_client, "MAX_PAGES", 2)
+    store = ProposalStore(tmp_path / "db.sqlite")
+
+    class FullPageSession(CrmFake):
+        def get(self, url: str, params: dict[str, Any] | None = None, timeout: Any = None) -> FakeResponse:
+            path = url.rstrip("/")
+            if path.endswith("/accounts"):
+                page_size = int((params or {}).get("page_size") or 50)
+                filler = [
+                    _account(f"FILL{i}", **{fields.NAME: f"Filler {i}", fields.STREET: f"{i} Oak St"})
+                    for i in range(page_size)
+                ]
+                return FakeResponse({"data": filler})
+            return super().get(url, params=params, timeout=timeout)
+
+    session = FullPageSession({"PARENT": _parent()})
+    stored = _approve(store, _create_proposal())
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert session.posts == []
+    assert session.patches == []
+    assert "pagination did not complete" in (store.list_attempts(stored.id)[-1].error_text or "").lower()
+
+
+def test_chow_blocked_when_account_scan_hits_max_pages(settings, tmp_path, monkeypatch):
+    from bellhaven_sync import crm_client
+
+    monkeypatch.setattr(crm_client, "MAX_PAGES", 2)
+    store = ProposalStore(tmp_path / "db.sqlite")
+    old = _account(
+        "OLD1",
+        **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300},
+    )
+
+    class FullPageSession(CrmFake):
+        def get(self, url: str, params: dict[str, Any] | None = None, timeout: Any = None) -> FakeResponse:
+            path = url.rstrip("/")
+            if path.endswith("/accounts"):
+                page_size = int((params or {}).get("page_size") or 50)
+                filler = [
+                    _account(f"FILL{i}", **{fields.NAME: f"Filler {i}", fields.STREET: f"{i} Oak St"})
+                    for i in range(page_size)
+                ]
+                return FakeResponse({"data": filler})
+            return super().get(url, params=params, timeout=timeout)
+
+    session = FullPageSession({"OLD1": old, "PARENT": _parent(), "WRONG": _wrong_parent()})
+    stored = _approve(store, _chow_proposal())
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert session.posts == []
+    assert session.patches == []
+    assert "pagination did not complete" in (store.list_attempts(stored.id)[-1].error_text or "").lower()
+
+
+def test_final_3xx_post_is_not_applied(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    session.write_status_code = 302
+    session.write_response_payload = None
+    session.write_response_text = "Found"
+    stored = _approve(store, _create_proposal())
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.applied == 0
+    assert report.failed == 1
+    assert store.list_attempts(stored.id)[-1].state == STATE_UNCERTAIN
+    assert store.successful_attempt(stored.id) is None
+    assert "not confirmed (302)" in (store.list_attempts(stored.id)[-1].error_text or "")
+
+
+def test_final_3xx_patch_is_not_applied(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1"), "PARENT": _parent()})
+    session.write_status_code = 302
+    session.write_response_payload = None
+    session.write_response_text = "Found"
+    stored = _approve(store, _update_proposal(**{fields.PHONE: "419-555-9999"}))
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.applied == 0
+    assert report.failed == 1
+    assert store.list_attempts(stored.id)[-1].state == STATE_UNCERTAIN
+    assert store.successful_attempt(stored.id) is None
+    assert "not confirmed (302)" in (store.list_attempts(stored.id)[-1].error_text or "")

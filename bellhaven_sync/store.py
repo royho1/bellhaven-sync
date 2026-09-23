@@ -13,7 +13,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .proposals import STATUS_APPROVED, STATUS_VALUES, Proposal, ProposalBatch
+from .proposals import (
+    ACTION_CHOW,
+    ACTION_CREATE_ACCOUNT,
+    STATUS_APPROVED,
+    STATUS_VALUES,
+    Proposal,
+    ProposalBatch,
+)
+from . import fields
+from .normalize import (
+    normalize_city,
+    normalize_name,
+    normalize_state,
+    normalize_street,
+    normalize_zip,
+)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS reconciliation_runs (
@@ -183,6 +198,97 @@ class CreateIdentityParts:
         return True
 
 
+class CreateIdentityError(ValueError):
+    """Approved create/CHOW body cannot form a safe identity reservation."""
+
+
+def _evidence_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def _canonical_identity_value(key: str, value: Any) -> str | None:
+    if _evidence_text(value) is None:
+        return None
+    raw = str(value)
+    if key == fields.NAME:
+        canon = normalize_name(raw)
+    elif key == fields.STREET:
+        house, street = normalize_street(raw)
+        canon = f"{house} {street}".strip()
+    elif key == fields.CITY:
+        canon = normalize_city(raw)
+    elif key == fields.STATE:
+        canon = normalize_state(raw)
+    elif key == fields.ZIP:
+        canon = normalize_zip(raw)
+    else:
+        canon = raw.strip()
+    return canon if canon else None
+
+
+_CREATE_LOCK_CORE_FIELDS = (fields.NAME, fields.STREET, fields.STATE)
+
+
+def create_identity_parts_from_body(body: dict[str, Any]) -> CreateIdentityParts:
+    """Canonical structured create identity for overlap-aware reservations."""
+    parent = str(body.get(fields.PARENT_ID) or "").strip()
+    if not parent:
+        raise CreateIdentityError(
+            "Cannot form a safe create identity lock from the approved create body "
+            "(missing parent_id)."
+        )
+    core: dict[str, str] = {}
+    for key in _CREATE_LOCK_CORE_FIELDS:
+        value = _canonical_identity_value(key, body.get(key))
+        if value is None:
+            raise CreateIdentityError(
+                "Cannot form a safe create identity lock from the approved create body "
+                f"(missing usable {key})."
+            )
+        core[key] = value
+    return CreateIdentityParts(
+        parent_id=parent,
+        name_norm=core[fields.NAME],
+        street_norm=core[fields.STREET],
+        state_norm=core[fields.STATE],
+        city_norm=_canonical_identity_value(fields.CITY, body.get(fields.CITY)),
+        zip_norm=_canonical_identity_value(fields.ZIP, body.get(fields.ZIP)),
+    )
+
+
+def create_body_from_proposal_record(action_type: str, proposed_values: dict[str, Any]) -> dict[str, Any]:
+    """Build the create-identity body from a persisted proposal's approved values."""
+    if action_type == ACTION_CREATE_ACCOUNT:
+        body = dict(proposed_values)
+        body[fields.CREATED_BY_CANDIDATE] = True
+        return body
+    if action_type == ACTION_CHOW:
+        template = proposed_values.get("new_account_template")
+        parent = proposed_values.get("new_account_parent_id")
+        if not isinstance(template, dict) or not parent:
+            raise CreateIdentityError(
+                "CHOW proposal is missing new_account_template or new_account_parent_id."
+            )
+        body = dict(template)
+        body[fields.PARENT_ID] = parent
+        body[fields.CREATED_BY_CANDIDATE] = True
+        return body
+    raise CreateIdentityError(
+        f"Unsupported action_type {action_type!r} for create-identity reconstruction."
+    )
+
+
+@dataclass(frozen=True)
+class _PreservedCreateLock:
+    identity: CreateIdentityParts
+    proposal_id: int
+    attempt_id: int
+    claimed_at: str
+
+
 @dataclass(frozen=True)
 class ApplicationAttempt:
     id: int
@@ -235,20 +341,100 @@ class ProposalStore:
             # Base schema first (safe against legacy DBs). Create-identity locks and
             # their structured-column index are applied only after migration.
             conn.executescript(SCHEMA_SQL)
-            self._migrate_lock_tables(conn)
-            conn.executescript(CREATE_IDENTITY_LOCKS_SQL)
+            self._ensure_create_identity_locks(conn)
             conn.commit()
 
-    def _migrate_lock_tables(self, conn: sqlite3.Connection) -> None:
-        """Drop a legacy opaque-key create_identity_locks table before structured DDL."""
+    def _ensure_create_identity_locks(self, conn: sqlite3.Connection) -> None:
+        """Migrate legacy opaque locks, then create structured table/index."""
+        preserved = self._migrate_lock_tables(conn)
+        conn.executescript(CREATE_IDENTITY_LOCKS_SQL)
+        for row in preserved:
+            conn.execute(
+                """
+                INSERT INTO create_identity_locks (
+                    parent_id, name_norm, street_norm, state_norm, city_norm, zip_norm,
+                    proposal_id, attempt_id, claimed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row.identity.parent_id,
+                    row.identity.name_norm,
+                    row.identity.street_norm,
+                    row.identity.state_norm,
+                    row.identity.city_norm,
+                    row.identity.zip_norm,
+                    row.proposal_id,
+                    row.attempt_id,
+                    row.claimed_at,
+                ),
+            )
+
+    def _migrate_lock_tables(self, conn: sqlite3.Connection) -> list[_PreservedCreateLock]:
+        """Drop a legacy opaque-key table, preserving unresolved reservations."""
         cols = {
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(create_identity_locks)").fetchall()
         }
         if not cols:
-            return
-        if "identity_key" in cols or "name_norm" not in cols:
-            conn.execute("DROP TABLE IF EXISTS create_identity_locks")
+            return []
+        if "identity_key" not in cols and "name_norm" in cols:
+            return []
+
+        legacy_rows = conn.execute(
+            """
+            SELECT identity_key, proposal_id, attempt_id, claimed_at
+            FROM create_identity_locks
+            """
+        ).fetchall()
+        preserved: list[_PreservedCreateLock] = []
+        for row in legacy_rows:
+            proposal_id = int(row["proposal_id"])
+            attempt_id = int(row["attempt_id"])
+            attempt = conn.execute(
+                "SELECT state FROM application_attempts WHERE id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if attempt is None:
+                raise RuntimeError(
+                    f"Cannot migrate create-identity lock for proposal {proposal_id}: "
+                    f"application attempt {attempt_id} is missing. "
+                    "Refusing to discard an unresolved reservation."
+                )
+            state = str(attempt["state"])
+            if state not in {STATE_IN_PROGRESS, STATE_UNCERTAIN}:
+                continue
+            proposal = conn.execute(
+                "SELECT action_type, proposed_values_json FROM proposals WHERE id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if proposal is None:
+                raise RuntimeError(
+                    f"Cannot migrate create-identity lock for proposal {proposal_id}: "
+                    "proposal row is missing. Refusing to discard an unresolved reservation."
+                )
+            try:
+                proposed = _loads(str(proposal["proposed_values_json"]))
+                if not isinstance(proposed, dict):
+                    raise CreateIdentityError("proposed_values is not an object")
+                body = create_body_from_proposal_record(str(proposal["action_type"]), proposed)
+                identity = create_identity_parts_from_body(body)
+            except (CreateIdentityError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"Cannot migrate unresolved create-identity lock for proposal {proposal_id} "
+                    f"attempt {attempt_id} (state={state}): {exc}. "
+                    "Refusing to discard an active reservation."
+                ) from exc
+            preserved.append(
+                _PreservedCreateLock(
+                    identity=identity,
+                    proposal_id=proposal_id,
+                    attempt_id=attempt_id,
+                    claimed_at=str(row["claimed_at"]),
+                )
+            )
+
+        conn.execute("DROP TABLE IF EXISTS create_identity_locks")
+        return preserved
 
     def save_run(self, batch: ProposalBatch, *, started_at: str | None = None) -> int:
         """Persist a new reconciliation run and its proposals. Never mutates old rows."""

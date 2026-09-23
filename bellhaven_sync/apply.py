@@ -18,13 +18,6 @@ import requests
 
 from . import chow, crm_client, fields
 from .config import DEFAULT_TIMEOUT, Settings, redact
-from .normalize import (
-    normalize_city,
-    normalize_name,
-    normalize_state,
-    normalize_street,
-    normalize_zip,
-)
 from .proposals import (
     ACTION_CHOW,
     ACTION_CREATE_ACCOUNT,
@@ -50,9 +43,12 @@ from .store import (
     STATE_IN_PROGRESS,
     STATE_PLANNED,
     STATE_UNCERTAIN,
+    CreateIdentityError,
     CreateIdentityParts,
     ProposalStore,
     StoredProposal,
+    _canonical_identity_value,
+    create_identity_parts_from_body,
 )
 
 WRITABLE_ACTIONS = frozenset(
@@ -84,9 +80,6 @@ CREATE_FIELDS_ALLOW = UPDATE_FIELDS_ALLOW | {fields.PARENT_ID, fields.STATUS}
 CREATE_STATUS_ALLOW = frozenset({fields.STATUS_ACTIVE, fields.STATUS_INACTIVE})
 SUPPORTED_CARE = frozenset(SUPPORTED_CARE_TYPES)
 CREATE_IDENTITY_FIELDS = (fields.NAME, fields.STREET, fields.CITY, fields.STATE, fields.ZIP)
-# Core lock fields are always required. City/ZIP are optional discriminators checked
-# under structured overlap rules so partial vs complete same-facility still conflicts.
-CREATE_LOCK_CORE_FIELDS = (fields.NAME, fields.STREET, fields.STATE)
 IN_PROGRESS_CLAIM_MESSAGE = (
     "A previous execute attempt is still in_progress. It may have been interrupted "
     "after a CRM write. Refusing another execution until the prior attempt is reconciled."
@@ -732,60 +725,12 @@ def _resolve_create_id(
     return None
 
 
-def _evidence_text(value: Any) -> str | None:
-    """Return stripped text evidence, or None when the proposed value is blank/missing."""
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text if text else None
-
-
-def _canonical_identity_value(key: str, value: Any) -> str | None:
-    """Canonicalize one identity field, or None when evidence is blank/unavailable."""
-    if _evidence_text(value) is None:
-        return None
-    raw = str(value)
-    if key == fields.NAME:
-        canon = normalize_name(raw)
-    elif key == fields.STREET:
-        house, street = normalize_street(raw)
-        canon = f"{house} {street}".strip()
-    elif key == fields.CITY:
-        canon = normalize_city(raw)
-    elif key == fields.STATE:
-        canon = normalize_state(raw)
-    elif key == fields.ZIP:
-        canon = normalize_zip(raw)
-    else:
-        canon = raw.strip()
-    return canon if canon else None
-
-
 def _create_identity_parts(body: dict[str, Any]) -> CreateIdentityParts:
     """Canonical structured create identity for overlap-aware reservations."""
-    parent = str(body.get(fields.PARENT_ID) or "").strip()
-    if not parent:
-        raise ApplyError(
-            "Cannot form a safe create identity lock from the approved create body "
-            "(missing parent_id). Refusing create."
-        )
-    core: dict[str, str] = {}
-    for key in CREATE_LOCK_CORE_FIELDS:
-        value = _canonical_identity_value(key, body.get(key))
-        if value is None:
-            raise ApplyError(
-                "Cannot form a safe create identity lock from the approved create body "
-                f"(missing usable {key}). Refusing create."
-            )
-        core[key] = value
-    return CreateIdentityParts(
-        parent_id=parent,
-        name_norm=core[fields.NAME],
-        street_norm=core[fields.STREET],
-        state_norm=core[fields.STATE],
-        city_norm=_canonical_identity_value(fields.CITY, body.get(fields.CITY)),
-        zip_norm=_canonical_identity_value(fields.ZIP, body.get(fields.ZIP)),
-    )
+    try:
+        return create_identity_parts_from_body(body)
+    except CreateIdentityError as exc:
+        raise ApplyError(f"{exc} Refusing create.") from None
 
 
 def _claim_create_identity(
@@ -913,6 +858,13 @@ def _read_write_response(response: Any, label: str) -> Any:
         raise ApplyError(f"{label} was not confirmed ({status}): {text}. Not retrying.", uncertain=True)
     if status >= 400:
         raise ApplyError(f"{label} rejected ({status}): {text}")
+    if not (200 <= status < 300):
+        # Final 3xx (and any other non-2xx) is not confirmed success. Prefer uncertain
+        # over falsely recording applied when the write may have reached the CRM.
+        raise ApplyError(
+            f"{label} was not confirmed ({status}): {text}. Not retrying.",
+            uncertain=True,
+        )
     try:
         return response.json()
     except ValueError:
