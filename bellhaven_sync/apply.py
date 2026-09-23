@@ -375,7 +375,7 @@ def _execute(
         )
         return None
     if proposal.action_type == ACTION_CREATE_ACCOUNT:
-        return _create_account(proposal.proposed_values, session, settings)
+        return _create_account(proposal, store=store, session=session, settings=settings)
     if proposal.action_type == ACTION_CHOW:
         return _apply_chow(proposal, settings=settings, store=store, session=session, attempt_id=attempt_id)
     raise ApplyError(f"unknown action {proposal.action_type!r}")
@@ -392,17 +392,33 @@ def _patch_existing(
     _patch(session, settings, str(proposal.account_id), body)
 
 
-def _create_account(proposed: dict[str, Any], session: Any, settings: Settings) -> str:
+def _create_account(
+    proposal: StoredProposal,
+    *,
+    store: ProposalStore,
+    session: Any,
+    settings: Settings,
+) -> str:
+    proposed = proposal.proposed_values
     body = {key: proposed[key] for key in CREATE_FIELDS_ALLOW if key in proposed}
     body[fields.CREATED_BY_CANDIDATE] = True
     _require_account(str(body[fields.PARENT_ID]), session, settings)
-    existing = _matching_created_accounts(body, session, settings)
-    if len(existing) > 1:
-        raise ApplyError(
+    recovered = _resolve_create_id(
+        body,
+        proposal,
+        store,
+        session,
+        settings,
+        uncertain_message=(
+            "Previous create POST outcome is uncertain and no unique created account "
+            "is visible yet. Refusing a second POST."
+        ),
+        multiple_tool_message=(
             "multiple tool-created accounts match this create; stopping for human review"
-        )
-    if len(existing) == 1:
-        return str(existing[0].get(fields.ACCOUNT_ID))
+        ),
+    )
+    if recovered is not None:
+        return recovered
     payload = _post(session, settings, "/accounts", body)
     account_id = _account_id(payload)
     if not account_id:
@@ -445,23 +461,23 @@ def _apply_chow(
         create_body = {key: template[key] for key in CREATE_FIELDS_ALLOW if key in template}
         create_body[fields.PARENT_ID] = parent_id
         create_body[fields.CREATED_BY_CANDIDATE] = True
-        existing = _matching_created_accounts(create_body, session, settings)
-        if len(existing) > 1:
-            raise ApplyError(
-                "multiple tool-created accounts match this CHOW create; stopping for human review"
-            )
-        if len(existing) == 1:
-            new_id = str(existing[0].get(fields.ACCOUNT_ID))
-            if not new_id:
-                raise ApplyError(
-                    "recovered CHOW account is missing account_id; stopping for human review"
-                )
-            store.update_attempt(attempt_id, state=STATE_IN_PROGRESS, created_account_id=new_id)
-        elif store.has_uncertain_attempt(proposal.id):
-            raise ApplyError(
+        recovered = _resolve_create_id(
+            create_body,
+            proposal,
+            store,
+            session,
+            settings,
+            uncertain_message=(
                 "Previous CHOW POST outcome is uncertain and no unique created account "
                 "is visible yet. Refusing a second POST."
-            )
+            ),
+            multiple_tool_message=(
+                "multiple tool-created accounts match this CHOW create; stopping for human review"
+            ),
+        )
+        if recovered is not None:
+            new_id = recovered
+            store.update_attempt(attempt_id, state=STATE_IN_PROGRESS, created_account_id=new_id)
         else:
             payload = _post(session, settings, "/accounts", create_body)
             new_id = _account_id(payload)
@@ -476,24 +492,63 @@ def _apply_chow(
     return new_id
 
 
-def _matching_created_accounts(
+@dataclass(frozen=True)
+class _CreateMatches:
+    tool_matches: list[dict[str, Any]]
+    non_tool_matches: list[dict[str, Any]]
+
+
+def _matching_accounts_for_create(
     body: dict[str, Any],
     session: Any,
     settings: Settings,
-) -> list[dict[str, Any]]:
-    found: list[dict[str, Any]] = []
+) -> _CreateMatches:
+    tool_matches: list[dict[str, Any]] = []
+    non_tool_matches: list[dict[str, Any]] = []
     try:
-        accounts = crm_client.iter_accounts(session=session, settings=settings)
-        for account in accounts:
-            if account.get(fields.CREATED_BY_CANDIDATE) is not True:
-                continue
+        for account in crm_client.iter_accounts(session=session, settings=settings):
             if str(account.get(fields.PARENT_ID) or "") != str(body.get(fields.PARENT_ID) or ""):
                 continue
-            if _same_identity(account, body):
-                found.append(account)
+            if not _same_identity(account, body):
+                continue
+            if account.get(fields.CREATED_BY_CANDIDATE) is True:
+                tool_matches.append(account)
+            else:
+                non_tool_matches.append(account)
     except crm_client.CrmError as exc:
         raise ApplyError(f"could not scan for previously created accounts: {exc}") from None
-    return found
+    return _CreateMatches(tool_matches=tool_matches, non_tool_matches=non_tool_matches)
+
+
+def _resolve_create_id(
+    body: dict[str, Any],
+    proposal: StoredProposal,
+    store: ProposalStore,
+    session: Any,
+    settings: Settings,
+    *,
+    uncertain_message: str,
+    multiple_tool_message: str,
+) -> str | None:
+    """Return a unique tool-created account id to reuse, or None if a first POST is allowed."""
+    matches = _matching_accounts_for_create(body, session, settings)
+    if matches.non_tool_matches:
+        raise ApplyError(
+            "A matching CRM account now exists but was not created by this tool. "
+            "Refusing to create a duplicate; run sync and review again."
+        )
+    if len(matches.tool_matches) > 1:
+        raise ApplyError(multiple_tool_message)
+    if len(matches.tool_matches) == 1:
+        account_id = str(matches.tool_matches[0].get(fields.ACCOUNT_ID) or "")
+        if not account_id:
+            raise ApplyError(
+                "recovered create account is missing account_id; stopping for human review"
+            )
+        return account_id
+    if store.has_uncertain_attempt(proposal.id):
+        raise ApplyError(uncertain_message)
+    return None
 
 
 def _same_identity(account: dict[str, Any], body: dict[str, Any]) -> bool:

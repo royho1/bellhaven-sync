@@ -158,18 +158,22 @@ Four branches, each reviewed and merged before the next starts:
   16. Uncertain write outcomes (`ApplyError(uncertain=True)`) persist as attempt
      state `uncertain`, not ordinary `failed`/`blocked`. That durable flag is how
      resume knows a prior POST may have succeeded without an id.
-  17. CHOW never issues a second POST after an uncertain POST. With no persisted
-     `created_account_id`, it scans for an exact tool-created match
-     (`created_by_candidate`, correct parent, approved identity/address). Exactly
-     one match is recovered and linked; more than one stops for human review; zero
-     matches with a prior uncertain attempt refuse another POST fail-closed; zero
-     matches with no prior uncertain attempt may POST once.
+  17. Ordinary create and CHOW share the same pre-create scan. Neither issues a
+     second POST after an uncertain POST unless a unique tool-created account is
+     first recovered. With no persisted `created_account_id`: scan for exact
+     matches under the expected parent using approved identity/address evidence.
+     Matching non-tool accounts (`created_by_candidate` is not True) are CRM drift
+     and block both ordinary create and CHOW create (no adopt, no POST, no PATCH).
+     With no non-tool matches: exactly one tool-created match is recovered; more
+     than one stops for human review; zero matches with a prior uncertain attempt
+     refuse another POST fail-closed; zero matches with no prior uncertain attempt
+     may POST once.
   18. Recovery-scan CRM read failures (`crm_client.CrmError` from
-     `_matching_created_accounts`) become `ApplyError` for the current proposal
-     only. The attempt ends blocked/failed; later approved proposals in the same
+     `_matching_accounts_for_create`) become `ApplyError` for the current proposal
+     only. The attempt ends blocked; later approved proposals in the same
      `run_apply()` invocation are still considered. No POST/PATCH on an untrusted
      scan.
-- Test suite on this branch: **154 passed**, fixture-based, no live POST/PATCH.
+- Test suite on this branch: **159 passed**, fixture-based, no live POST/PATCH.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
 - Real-world limit: execute mode is implemented and tested with fake sessions
   only. It has not been run against the assessment API.

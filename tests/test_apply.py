@@ -139,6 +139,22 @@ def _parent() -> dict[str, Any]:
     return _account("PARENT", **{fields.PARENT_ID: "", fields.NAME: "Bellhaven Senior Living"})
 
 
+def _wrong_parent() -> dict[str, Any]:
+    """Former parent for CHOW fixtures; must not match the new-account template identity."""
+    return _account(
+        "WRONG",
+        **{
+            fields.PARENT_ID: "",
+            fields.NAME: "Wrong Parent Co",
+            fields.STREET: "1 Other Road",
+            fields.CITY: "Columbus",
+            fields.STATE: "OH",
+            fields.ZIP: "43215",
+            fields.PHONE: "614-555-0000",
+        },
+    )
+
+
 def _run(settings, store, session, proposal, *, execute=False, dry_run=True):
     chosen = replace(settings, dry_run=dry_run)
     return run_apply(
@@ -427,10 +443,13 @@ def test_create_recovers_one_tool_owned_account_and_stops_on_two(settings, tmp_p
             fields.CITY: "Tiffin",
             fields.STATE: "OH",
             fields.ZIP: "44880",
+            fields.PARENT_ID: "OTHER-PARENT",
             fields.CREATED_BY_CANDIDATE: False,
         },
     )
-    session = CrmFake({"PARENT": _parent(), "OWN1": owned, "OLD": lookalike})
+    session = CrmFake(
+        {"PARENT": _parent(), "OWN1": owned, "OLD": lookalike, "OTHER-PARENT": _account("OTHER-PARENT")}
+    )
     stored = _approve(
         store,
         Proposal(
@@ -487,7 +506,7 @@ def test_chow_posts_then_patches_only_the_link(settings, tmp_path):
             fields.OUTSTANDING_AR: 300,
         },
     )
-    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _account("WRONG")})
+    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _wrong_parent()})
     stored = _approve(
         store,
         Proposal(
@@ -716,7 +735,7 @@ def test_chow_recovers_lost_post_response_without_second_post(settings, tmp_path
         "OLD1",
         **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300},
     )
-    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _account("WRONG")})
+    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _wrong_parent()})
     session.lose_post_response = 1
     stored = _approve(store, _chow_proposal())
 
@@ -744,7 +763,7 @@ def test_chow_uncertain_with_no_visible_account_refuses_second_post(settings, tm
         "OLD1",
         **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300},
     )
-    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _account("WRONG")})
+    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _wrong_parent()})
     session.post_failures = 1
     stored = _approve(store, _chow_proposal())
 
@@ -789,7 +808,7 @@ def test_chow_multiple_recovery_matches_blocks_without_write(settings, tmp_path)
         {
             "OLD1": old,
             "PARENT": _parent(),
-            "WRONG": _account("WRONG"),
+            "WRONG": _wrong_parent(),
             "OWN-A": twin_a,
             "OWN-B": twin_b,
         }
@@ -854,3 +873,176 @@ def test_recovery_scan_crm_error_stays_on_current_proposal(settings, tmp_path):
     assert "could not scan" in error
     assert store.successful_attempt(update_stored.id) is not None
     assert session.patches == [("C1", {fields.PHONE: "419-555-9999"})]
+
+
+def _create_proposal(proposed: dict[str, Any] | None = None) -> Proposal:
+    body = proposed or {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine St",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44880",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    return Proposal(
+        action_type=ACTION_CREATE_ACCOUNT,
+        account_id=None,
+        facility_url="https://example.test/new",
+        current_values={},
+        proposed_values=body,
+        evidence={},
+        confidence="medium",
+    )
+
+
+def test_create_uncertain_with_no_visible_account_refuses_second_post(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    session.post_failures = 1
+    stored = _approve(store, _create_proposal())
+
+    first = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert first.failed == 1
+    assert len(session.posts) == 1
+    assert store.has_uncertain_attempt(stored.id)
+    assert store.list_attempts(stored.id)[-1].state == STATE_UNCERTAIN
+    assert store.created_account_id_for_proposal(stored.id) is None
+
+    second = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert second.blocked == 1
+    assert len(session.posts) == 1
+    assert store.successful_attempt(stored.id) is None
+    error = store.list_attempts(stored.id)[-1].error_text or ""
+    assert "Refusing a second POST" in error
+    assert store.list_attempts(stored.id)[-1].state == STATE_BLOCKED
+
+
+def test_create_recovers_lost_post_response_without_second_post(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    session.lose_post_response = 1
+    stored = _approve(store, _create_proposal())
+
+    first = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert first.failed == 1
+    assert len(session.posts) == 1
+    assert store.has_uncertain_attempt(stored.id)
+    assert store.created_account_id_for_proposal(stored.id) is None
+    recovered_id = next(aid for aid in session.accounts if aid.startswith("NEW"))
+    assert session.accounts[recovered_id][fields.CREATED_BY_CANDIDATE] is True
+
+    second = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert second.applied == 1
+    assert len(session.posts) == 1
+    assert store.successful_attempt(stored.id).created_account_id == recovered_id
+
+
+def test_non_tool_match_blocks_ordinary_create(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    proposed = {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine St",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44880",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    outsider = _account(
+        "OUT1",
+        **{
+            fields.NAME: "Brand New Place",
+            fields.STREET: "9 Pine St",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44880",
+            fields.PARENT_ID: "PARENT",
+            fields.CREATED_BY_CANDIDATE: False,
+        },
+    )
+    session = CrmFake({"PARENT": _parent(), "OUT1": outsider})
+    stored = _approve(store, _create_proposal(proposed))
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert session.posts == []
+    assert store.successful_attempt(stored.id) is None
+    assert store.created_account_id_for_proposal(stored.id) is None
+    error = store.list_attempts(stored.id)[-1].error_text or ""
+    assert "not created by this tool" in error
+
+
+def test_non_tool_match_blocks_chow_create(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    template = {
+        fields.NAME: "Bellhaven of Tiffin",
+        fields.STREET: "100 Main Street",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44883",
+    }
+    outsider = _account(
+        "OUT1",
+        **{**template, fields.PARENT_ID: "PARENT", fields.CREATED_BY_CANDIDATE: False},
+    )
+    old = _account(
+        "OLD1",
+        **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300},
+    )
+    session = CrmFake(
+        {"OLD1": old, "PARENT": _parent(), "WRONG": _wrong_parent(), "OUT1": outsider}
+    )
+    stored = _approve(store, _chow_proposal(template=template))
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert session.posts == []
+    assert session.patches == []
+    assert store.created_account_id_for_proposal(stored.id) is None
+    error = store.list_attempts(stored.id)[-1].error_text or ""
+    assert "not created by this tool" in error
+
+
+def test_mixed_tool_and_non_tool_matches_block_create(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    proposed = {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine St",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44880",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    tool = _account(
+        "OWN1",
+        **{
+            fields.NAME: "Brand New Place",
+            fields.STREET: "9 Pine St",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44880",
+            fields.PARENT_ID: "PARENT",
+            fields.CREATED_BY_CANDIDATE: True,
+        },
+    )
+    outsider = _account(
+        "OUT1",
+        **{
+            fields.NAME: "Brand New Place",
+            fields.STREET: "9 Pine St",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44880",
+            fields.PARENT_ID: "PARENT",
+            fields.CREATED_BY_CANDIDATE: False,
+        },
+    )
+    session = CrmFake({"PARENT": _parent(), "OWN1": tool, "OUT1": outsider})
+    stored = _approve(store, _create_proposal(proposed))
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert session.posts == []
+    assert store.successful_attempt(stored.id) is None
+    assert store.created_account_id_for_proposal(stored.id) is None
+    error = store.list_attempts(stored.id)[-1].error_text or ""
+    assert "not created by this tool" in error
