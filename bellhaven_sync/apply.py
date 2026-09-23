@@ -505,6 +505,9 @@ def _apply_chow(
     linked = str(live.get(fields.CHOW_CURRENT_ACCOUNT) or "")
 
     if remembered and linked == remembered:
+        # Link already complete; clear any identity lock retained by an earlier
+        # uncertain attempt for this proposal so cleanup is not stuck on the old attempt id.
+        store.release_create_identity_for_proposal(proposal.id)
         return remembered
     if linked and remembered and linked != remembered:
         raise ApplyError(

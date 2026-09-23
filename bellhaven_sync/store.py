@@ -497,6 +497,23 @@ class ProposalStore:
             )
             conn.commit()
 
+    def release_create_identity_for_proposal(self, proposal_id: int) -> None:
+        """Drop any create-identity reservation held by attempts for this proposal."""
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM create_identity_locks WHERE proposal_id = ?",
+                (proposal_id,),
+            )
+            conn.commit()
+
+    def has_create_identity_lock_for_proposal(self, proposal_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM create_identity_locks WHERE proposal_id = ? LIMIT 1",
+                (proposal_id,),
+            ).fetchone()
+        return row is not None
+
     def update_attempt(
         self,
         attempt_id: int,
@@ -521,7 +538,17 @@ class ProposalStore:
             )
             if cur.rowcount != 1:
                 raise KeyError(f"application attempt {attempt_id} not found")
-            if state in _CREATE_IDENTITY_RELEASE_STATES:
+            if state == STATE_APPLIED:
+                owned = conn.execute(
+                    "SELECT proposal_id FROM application_attempts WHERE id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                if owned is not None:
+                    conn.execute(
+                        "DELETE FROM create_identity_locks WHERE proposal_id = ?",
+                        (int(owned["proposal_id"]),),
+                    )
+            elif state in _CREATE_IDENTITY_RELEASE_STATES:
                 conn.execute(
                     "DELETE FROM create_identity_locks WHERE attempt_id = ?",
                     (attempt_id,),

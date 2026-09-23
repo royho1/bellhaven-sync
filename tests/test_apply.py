@@ -49,6 +49,7 @@ class CrmFake:
         self.post_failures = 0
         self.patch_failures = 0
         self.lose_post_response = 0
+        self.lose_patch_response = 0
         self.list_error: Exception | None = None
         self._seq = 1
 
@@ -87,6 +88,9 @@ class CrmFake:
             self.patch_failures -= 1
             raise requests.ConnectionError(f"patch dropped {FAKE_TOKEN}")
         self.accounts[account_id].update(body)
+        if self.lose_patch_response:
+            self.lose_patch_response -= 1
+            raise requests.Timeout(f"patch response lost {FAKE_TOKEN}")
         return FakeResponse(self.accounts[account_id])
 
 
@@ -1497,3 +1501,31 @@ def test_claim_refuses_when_approval_revoked_before_execute(settings, tmp_path):
     assert session.patches == []
     assert store.list_attempts(stored.id) == []
     assert any("no longer approved" in note for note in report.notes)
+
+
+def test_chow_uncertain_patch_release_identity_lock_after_reconcile(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    old = _account(
+        "OLD1",
+        **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300},
+    )
+    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _wrong_parent()})
+    session.lose_patch_response = 1
+    stored = _approve(store, _chow_proposal())
+
+    first = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert first.failed == 1
+    assert len(session.posts) == 1
+    assert len(session.patches) == 1
+    new_id = store.created_account_id_for_proposal(stored.id)
+    assert new_id
+    assert store.list_attempts(stored.id)[-1].state == STATE_UNCERTAIN
+    assert store.has_create_identity_lock_for_proposal(stored.id)
+    # PATCH landed remotely even though the response was lost.
+    assert session.accounts["OLD1"][fields.CHOW_CURRENT_ACCOUNT] == new_id
+
+    second = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert second.applied == 1
+    assert len(session.posts) == 1
+    assert store.successful_attempt(stored.id).created_account_id == new_id
+    assert not store.has_create_identity_lock_for_proposal(stored.id)
