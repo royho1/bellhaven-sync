@@ -84,14 +84,41 @@ def _collapse(text: str) -> str:
     return MULTI_SPACE_RE.sub(" ", text).strip()
 
 
+def _alnum_collapse(text: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace. Shared by names and phrases."""
+    return _collapse(NON_ALNUM_RE.sub(" ", text.lower()))
+
+
+def _filler_phrase_forms(phrase: str) -> set[str]:
+    """Forms a filler phrase can take after the same punctuation pipeline as names.
+
+    `nursing & rehabilitation` and `nursing and rehabilitation` must both become
+    matchable against text where `&` has already been turned into whitespace.
+    """
+    base = _alnum_collapse(phrase)
+    without_filler_words = _collapse(
+        " ".join(token for token in base.split() if token not in FILLER_WORDS)
+    )
+    return {form for form in (base, without_filler_words) if form}
+
+
+# Longest first so "nursing rehabilitation" wins over a shorter fragment.
+_NORMALIZED_FILLER_PHRASES = tuple(
+    sorted(
+        {form for phrase in FILLER_PHRASES for form in _filler_phrase_forms(phrase)},
+        key=len,
+        reverse=True,
+    )
+)
+
+
 def normalize_name(value: str | None) -> str:
     if not value:
         return ""
     text = value.lower()
     text = PAREN_RE.sub(" ", text)  # strips "(Parent Account)" and similar
-    text = NON_ALNUM_RE.sub(" ", text)
-    text = _collapse(text)
-    for phrase in FILLER_PHRASES:
+    text = _alnum_collapse(text)
+    for phrase in _NORMALIZED_FILLER_PHRASES:
         text = text.replace(phrase, " ")
     text = _collapse(text)
     tokens = [t for t in text.split() if t not in FILLER_WORDS]

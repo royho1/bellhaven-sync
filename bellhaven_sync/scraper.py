@@ -401,6 +401,14 @@ def scrape_bellhaven(
             "those records lack address evidence. Suppressing missing-on-site "
             "proposals until enrichment succeeds."
         )
+    if not enrich_pages:
+        complete = False
+        blockers.append(
+            "URL discovery succeeded but facility enrichment was intentionally "
+            "skipped (--urls-only / enrich_pages=False). Records lack address and "
+            "state evidence required for matching, so this scrape is not "
+            "reconciliation-complete."
+        )
 
     return ScrapeResult(
         facilities=facilities,

@@ -187,6 +187,24 @@ def test_complete_when_claim_matches_union():
     assert result.blockers == []
 
 
+def test_urls_only_is_never_reconciliation_complete():
+    # Even when the discovered URL count exactly matches the homepage claim,
+    # skipping enrichment leaves no address/state evidence for matching.
+    homepage = (FIXTURES / "homepage.html").read_text(encoding="utf-8").replace(
+        "35 communities", "5 communities"
+    )
+    result = scraper.scrape_bellhaven(
+        base_url=BASE,
+        fetch=fixture_fetcher({f"{BASE}/": homepage}),
+        enrich_pages=False,
+    )
+    assert result.claimed_count == 5
+    assert result.facility_count == 5
+    assert result.complete is False
+    assert any("enrichment was intentionally skipped" in b for b in result.blockers)
+    assert all(not f.state and not f.street for f in result.facilities)
+
+
 def test_missing_claimed_count_is_a_completeness_blocker():
     homepage = "<html><body><h1>Bellhaven</h1><p>Welcome.</p></body></html>"
     result = scraper.scrape_bellhaven(

@@ -90,23 +90,23 @@ Four branches, each reviewed and merged before the next starts:
 `feat/schema-discovery`, `feat/scrape-and-match`, `feat/proposals-and-review`,
 `feat/apply-and-schedule`.
 
-## Current status (2026-09-21 evening)
+## Current status (2026-09-22)
 
 - Branch 1 `feat/schema-discovery` is merged to `main`.
 - Branch 2 `feat/scrape-and-match` is open as [PR #2](https://github.com/royho1/bellhaven-sync/pull/2).
-  **Do not merge tonight.** Waiting on a clean Codex review (no P1/P2).
-- Latest Branch 2 fixes (not yet reviewed clean):
-  - State abbreviation is the two-letter token immediately before the ZIP, so
-    street tokens like `NE` / `US` are not mistaken for the state.
-  - Full state-name parsing prefers the longest terminal match, so
-    `West Virginia` resolves to `WV`, not `VA`.
-  - Facility enrichment failures (fetch/parse errors) force `complete=False` even
-    when the URL count matches the homepage claim.
-  - House numbers are required for tier-1/2 matches and street+ZIP duplicate keys.
-  - Completeness requires an exact homepage-count match (undercount and overcount
-    both block), and a missing claimed count also blocks.
-  - Listing and sitemap provenance tags are merged independently.
-- Test suite on this branch: 74 passed, fixture-based, no network required for
+  **Do not merge until Codex is clean on the latest commit (no P1/P2).**
+- HEAD addresses the three live Codex findings on `cc065f7`:
+  1. Matching re-ranks by each facility's best *currently available* candidate after
+     every assignment, so a stale tier-1 queue slot cannot steal a tier-2 claim.
+  2. `--urls-only` / `enrich_pages=False` is never reconciliation-complete, even when
+     the discovered URL count matches the homepage claim.
+  3. Filler phrases are normalized through the same punctuation pipeline as names, so
+     `Nursing & Rehabilitation` and `Nursing and Rehabilitation` strip identically.
+- Earlier Branch 2 hardening still in place: house numbers required for tier-1/2 and
+  duplicate keys; exact homepage-count match; enrichment failures incomplete;
+  longest full state-name match; state abbrev is the final pre-ZIP token; listing and
+  sitemap provenance merged independently.
+- Test suite on this branch: **77 passed**, fixture-based, no network required for
   scraper/matcher tests.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; do not treat a failed live
   scrape as a product bug.

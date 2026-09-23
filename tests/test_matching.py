@@ -336,3 +336,73 @@ def test_parent_never_uses_child_count_as_tiebreaker():
     result = resolve_parent([big, small, *kids])
     assert result.blocker is not None
     assert result.account_id is None
+
+
+def test_assignment_reranks_after_best_account_is_consumed():
+    """Stale tier-1 queue priority must not steal a tier-2 claim.
+
+    Setup:
+    - Account A and B share house number 100 in Akron but differ on street/ZIP.
+    - F_taker takes A at tier 1 (exact name).
+    - F_fallback initially prefers A at tier 1, with B only at tier 3.
+    - F_tier2 has a clean tier-2 claim to B.
+
+    After A is consumed, F_fallback's live best is tier 3 on B. A static queue
+    would still process F_fallback ahead of F_tier2 and wrongly hand B to the
+    weaker fallback. Re-ranking must give B to F_tier2.
+    """
+    account_a = _account(
+        **{
+            fields.ACCOUNT_ID: "A",
+            fields.NAME: "Alpha Oaks",
+            fields.STREET: "100 Oak Street",
+            fields.CITY: "Akron",
+            fields.STATE: "OH",
+            fields.ZIP: "44301",
+        }
+    )
+    account_b = _account(
+        **{
+            fields.ACCOUNT_ID: "B",
+            fields.NAME: "Bellhaven Beta Gardens",
+            fields.STREET: "100 Maple Avenue",
+            fields.CITY: "Akron",
+            fields.STATE: "OH",
+            fields.ZIP: "44302",
+        }
+    )
+    f_taker = _facility(
+        name="Alpha Oaks",
+        street="100 Oak St",
+        city="Akron",
+        state="OH",
+        zip="44301",
+        url="https://example.test/taker",
+    )
+    f_fallback = _facility(
+        name="Bellhaven Beta Gardens",
+        street="100 Oak Street",
+        city="Akron",
+        state="OH",
+        zip="44301",
+        url="https://example.test/fallback",
+    )
+    f_tier2 = _facility(
+        name="Maple Spot",
+        street="100 Maple Ave",
+        city="Akron",
+        state="OH",
+        zip="44399",
+        url="https://example.test/tier2",
+    )
+
+    results = {
+        r.facility.url: r
+        for r in match_facilities([f_fallback, f_tier2, f_taker], [account_a, account_b])
+    }
+
+    assert results["https://example.test/taker"].account["account_id"] == "A"
+    assert results["https://example.test/tier2"].account["account_id"] == "B"
+    assert results["https://example.test/tier2"].tier == 2
+    # F_fallback's only remaining claim was the weaker tier-3 on B; it must not win.
+    assert results["https://example.test/fallback"].account is None

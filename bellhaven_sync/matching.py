@@ -159,7 +159,12 @@ def match_facilities(
     facilities: Iterable[Facility],
     accounts: Iterable[dict[str, Any]],
 ) -> list[MatchResult]:
-    """Greedy one-to-one assignment by tier, then name similarity."""
+    """Greedy one-to-one assignment by best currently available candidate.
+
+    Priority is recomputed after every assignment. A facility whose initial
+    best account was taken must not keep that stale tier and steal a weaker
+    fallback from another facility with a stronger live claim.
+    """
     facility_list = list(facilities)
     account_list = list(accounts)
     account_norms = {a.get(fields.ACCOUNT_ID): account_location(a) for a in account_list}
@@ -186,39 +191,52 @@ def match_facilities(
         candidates.sort(key=lambda c: (c.tier, -c.name_similarity, c.account_id))
         per_facility.append((facility, fnorm, candidates))
 
-    # Flatten into assignment queue: best tier first.
-    queue: list[tuple[int, float, int]] = []
-    for idx, (_, _, candidates) in enumerate(per_facility):
-        if candidates:
-            best = candidates[0]
-            queue.append((best.tier, -best.name_similarity, idx))
-    queue.sort()
-
+    remaining = {idx for idx, (_, _, cands) in enumerate(per_facility) if cands}
     used_accounts: set[str] = set()
     used_facilities: set[int] = set()
     assigned: dict[int, MatchResult] = {}
 
-    for _, __, idx in queue:
-        if idx in used_facilities:
-            continue
-        facility, fnorm, candidates = per_facility[idx]
-        available = [c for c in candidates if c.account_id not in used_accounts]
-        if not available:
-            continue
+    while remaining:
+        best_key: tuple[int, float, int, str] | None = None
+        best_idx: int | None = None
+        best_available: list[MatchCandidate] = []
+        exhausted: list[int] = []
 
-        best = available[0]
+        for idx in remaining:
+            _, _, candidates = per_facility[idx]
+            available = [c for c in candidates if c.account_id not in used_accounts]
+            if not available:
+                exhausted.append(idx)
+                continue
+            top = available[0]
+            # Deterministic: tier, then higher name similarity, then facility
+            # index, then account id so equal claims resolve stably.
+            key = (top.tier, -top.name_similarity, idx, top.account_id)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_idx = idx
+                best_available = available
+
+        for idx in exhausted:
+            remaining.discard(idx)
+
+        if best_idx is None:
+            break
+
+        facility, fnorm, _ = per_facility[best_idx]
+        best = best_available[0]
         ambiguous = False
         runners: list[MatchCandidate] = []
-        if len(available) > 1:
-            second = available[1]
+        if len(best_available) > 1:
+            second = best_available[1]
             same_tier = second.tier == best.tier
             thin_margin = abs(best.name_similarity - second.name_similarity) < AMBIGUITY_MARGIN
             if same_tier or thin_margin:
                 ambiguous = True
-                runners = available[1:4]
+                runners = best_available[1:4]
 
         if ambiguous:
-            assigned[idx] = MatchResult(
+            assigned[best_idx] = MatchResult(
                 facility=facility,
                 facility_norm=fnorm,
                 account=None,
@@ -229,11 +247,12 @@ def match_facilities(
                 ambiguous=True,
                 runners_up=[best, *runners],
             )
-            used_facilities.add(idx)
+            used_facilities.add(best_idx)
+            remaining.discard(best_idx)
             continue
 
         account = accounts_by_id[best.account_id]
-        assigned[idx] = MatchResult(
+        assigned[best_idx] = MatchResult(
             facility=facility,
             facility_norm=fnorm,
             account=account,
@@ -244,7 +263,8 @@ def match_facilities(
             reasons=list(best.reasons),
         )
         used_accounts.add(best.account_id)
-        used_facilities.add(idx)
+        used_facilities.add(best_idx)
+        remaining.discard(best_idx)
 
     results: list[MatchResult] = []
     for idx, (facility, fnorm, _) in enumerate(per_facility):

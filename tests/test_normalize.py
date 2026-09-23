@@ -38,3 +38,13 @@ def test_state_is_uppercased():
     assert loc.city == "findlay"
     assert loc.house_number == "1800"
     assert loc.street == "n blanchard st"
+
+
+def test_ampersand_and_worded_filler_phrases_normalize_identically():
+    ampersand = normalize_name("Bellhaven Nursing & Rehabilitation")
+    worded = normalize_name("Bellhaven Nursing and Rehabilitation")
+    assert ampersand == worded
+    assert ampersand == "bellhaven"
+    # The filler phrase itself must be gone, not left as "nursing rehabilitation".
+    assert "nursing" not in ampersand
+    assert "rehabilitation" not in ampersand
