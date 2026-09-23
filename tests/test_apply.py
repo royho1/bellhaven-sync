@@ -1,0 +1,648 @@
+"""Apply path: approved proposals only, fake HTTP, no live CRM writes."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from typing import Any
+
+import pytest
+import requests
+
+from bellhaven_sync import fields
+from bellhaven_sync.apply import ExecuteWhileDryRunError, run_apply
+from bellhaven_sync.apply_cli import main as apply_main
+from bellhaven_sync.proposals import (
+    ACTION_CHOW,
+    ACTION_CREATE_ACCOUNT,
+    ACTION_REPARENT,
+    ACTION_REVIEW_AMBIGUOUS,
+    ACTION_UPDATE_FIELDS,
+    STATUS_APPROVED,
+    STATUS_PENDING,
+    STATUS_REJECTED,
+    Proposal,
+    ProposalBatch,
+)
+from bellhaven_sync.store import MODE_DRY_RUN, MODE_EXECUTE, STATE_APPLIED, STATE_BLOCKED, STATE_FAILED, STATE_PLANNED, ProposalStore
+from tests.conftest import FAKE_TOKEN, FakeResponse
+
+
+class CrmFake:
+    def __init__(self, accounts: dict[str, dict[str, Any]]):
+        self.accounts = accounts
+        self.posts: list[dict[str, Any]] = []
+        self.patches: list[tuple[str, dict[str, Any]]] = []
+        self.post_failures = 0
+        self.patch_failures = 0
+        self._seq = 1
+
+    def get(self, url: str, params: dict[str, Any] | None = None, timeout: Any = None) -> FakeResponse:
+        path = url.rstrip("/")
+        if path.endswith("/accounts"):
+            return FakeResponse({"data": list(self.accounts.values())})
+        account_id = path.rsplit("/", 1)[-1]
+        account = self.accounts.get(account_id)
+        if account is None:
+            return FakeResponse({"missing": True}, status_code=404, text="missing")
+        return FakeResponse(account)
+
+    def post(self, url: str, json: dict[str, Any] | None = None, timeout: Any = None) -> FakeResponse:
+        body = dict(json or {})
+        self.posts.append(body)
+        if self.post_failures:
+            self.post_failures -= 1
+            raise requests.ConnectionError(f"post dropped {FAKE_TOKEN}")
+        account_id = f"NEW{self._seq}"
+        self._seq += 1
+        created = {**body, fields.ACCOUNT_ID: account_id}
+        self.accounts[account_id] = created
+        return FakeResponse(created)
+
+    def patch(self, url: str, json: dict[str, Any] | None = None, timeout: Any = None) -> FakeResponse:
+        body = dict(json or {})
+        account_id = url.rstrip("/").rsplit("/", 1)[-1]
+        self.patches.append((account_id, body))
+        if self.patch_failures:
+            self.patch_failures -= 1
+            raise requests.ConnectionError(f"patch dropped {FAKE_TOKEN}")
+        self.accounts[account_id].update(body)
+        return FakeResponse(self.accounts[account_id])
+
+
+def _batch(proposal: Proposal) -> ProposalBatch:
+    return ProposalBatch(
+        proposals=[proposal],
+        scrape_complete=True,
+        parent_account_id="PARENT",
+        generated_at="2026-01-01T00:00:00+00:00",
+    )
+
+
+def _approve(store: ProposalStore, proposal: Proposal, status: str = STATUS_APPROVED):
+    run_id = store.save_run(_batch(proposal))
+    stored = store.list_proposals(run_id=run_id)[0]
+    if status != STATUS_PENDING:
+        store.set_status(stored.id, status)
+    return store.get_proposal(stored.id)
+
+
+def _account(account_id: str, **extra) -> dict[str, Any]:
+    base = {
+        fields.ACCOUNT_ID: account_id,
+        fields.NAME: "Bellhaven of Tiffin",
+        fields.PARENT_ID: "PARENT",
+        fields.STREET: "100 Main Street",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44883",
+        fields.CARE_TYPE: "Assisted Living",
+        fields.PHONE: "419-555-0100",
+        fields.STATUS: "Active",
+        fields.LIFETIME_REVENUE: 0,
+        fields.OUTSTANDING_AR: 0,
+        fields.CHOW_CURRENT_ACCOUNT: "",
+        fields.CREATED_BY_CANDIDATE: False,
+    }
+    base.update(extra)
+    return base
+
+
+def _parent() -> dict[str, Any]:
+    return _account("PARENT", **{fields.PARENT_ID: "", fields.NAME: "Bellhaven Senior Living"})
+
+
+def _run(settings, store, session, proposal, *, execute=False, dry_run=True):
+    chosen = replace(settings, dry_run=dry_run)
+    return run_apply(
+        settings=chosen,
+        store=store,
+        session=session,
+        run_id=proposal.run_id,
+        execute=execute,
+    )
+
+
+def test_pending_and_rejected_do_not_write(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1"), "PARENT": _parent()})
+    pending = Proposal(
+        action_type=ACTION_UPDATE_FIELDS,
+        account_id="C1",
+        facility_url="https://example.test/a",
+        current_values={fields.PHONE: "419-555-0100"},
+        proposed_values={fields.PHONE: "419-555-9999"},
+        evidence={},
+        confidence="high",
+    )
+    stored = _approve(store, pending, STATUS_PENDING)
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.applied == 0
+    assert session.patches == []
+    assert session.posts == []
+
+    rejected = _approve(store, pending, STATUS_REJECTED)
+    report = _run(settings, store, session, rejected, execute=True, dry_run=False)
+    assert report.applied == 0
+    assert session.patches == []
+
+
+def test_approved_review_only_and_unknown_action_do_not_write(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    review = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_REVIEW_AMBIGUOUS,
+            account_id=None,
+            facility_url="https://example.test/a",
+            current_values={},
+            proposed_values={},
+            evidence={},
+            confidence="ambiguous",
+        ),
+    )
+    report = _run(settings, store, session, review, execute=True, dry_run=False)
+    assert report.skipped_review == 1
+    assert session.posts == []
+    assert session.patches == []
+
+    unknown = _approve(
+        store,
+        Proposal(
+            action_type="merge_accounts",
+            account_id="C1",
+            facility_url=None,
+            current_values={},
+            proposed_values={"account_id": "C1"},
+            evidence={},
+            confidence="high",
+        ),
+    )
+    report = _run(settings, store, session, unknown, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert report.applied == 0
+    assert session.posts == []
+    assert session.patches == []
+
+
+def test_dry_run_plans_without_writes_and_execute_refuses_while_dry(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1"), "PARENT": _parent()})
+    stored = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_UPDATE_FIELDS,
+            account_id="C1",
+            facility_url="https://example.test/a",
+            current_values={fields.PHONE: "419-555-0100"},
+            proposed_values={fields.PHONE: "419-555-9999"},
+            evidence={},
+            confidence="high",
+        ),
+    )
+    report = _run(settings, store, session, stored, execute=False, dry_run=True)
+    assert report.mode == MODE_DRY_RUN
+    assert report.planned_patches == 1
+    assert report.planned_posts == 0
+    assert session.posts == []
+    assert session.patches == []
+    assert store.successful_attempt(stored.id) is None
+    assert store.list_attempts(stored.id)[0].state == STATE_PLANNED
+    assert store.get_proposal(stored.id).status == STATUS_APPROVED
+
+    with pytest.raises(ExecuteWhileDryRunError):
+        _run(settings, store, session, stored, execute=True, dry_run=True)
+    assert session.patches == []
+
+    code = apply_main(["--execute", "--db", str(store.db_path), "--run-id", str(stored.run_id)])
+    assert code == 2
+    assert session.patches == []
+
+
+def test_update_fields_patches_only_allowed_fields(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1"), "PARENT": _parent()})
+    stored = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_UPDATE_FIELDS,
+            account_id="C1",
+            facility_url="https://example.test/a",
+            current_values={fields.PHONE: "419-555-0100"},
+            proposed_values={fields.PHONE: "419-555-9999", fields.CITY: "Tiffin"},
+            evidence={},
+            confidence="high",
+        ),
+    )
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.applied == 1
+    assert session.posts == []
+    assert session.patches == [("C1", {fields.PHONE: "419-555-9999", fields.CITY: "Tiffin"})]
+    assert store.successful_attempt(stored.id).state == STATE_APPLIED
+    assert store.get_proposal(stored.id).status == STATUS_APPROVED
+
+    again = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert again.skipped_applied == 1
+    assert len(session.patches) == 1
+
+
+def test_update_fields_rejects_unsafe_keys_and_drift(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1"), "PARENT": _parent()})
+    unsafe = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_UPDATE_FIELDS,
+            account_id="C1",
+            facility_url="https://example.test/a",
+            current_values={fields.STATUS: "Active"},
+            proposed_values={fields.STATUS: "Inactive"},
+            evidence={},
+            confidence="high",
+        ),
+    )
+    report = _run(settings, store, session, unsafe, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert session.patches == []
+
+    drifted = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_UPDATE_FIELDS,
+            account_id="C1",
+            facility_url="https://example.test/a",
+            current_values={fields.PHONE: "419-555-0100"},
+            proposed_values={fields.PHONE: "419-555-9999"},
+            evidence={},
+            confidence="high",
+        ),
+    )
+    session.accounts["C1"][fields.PHONE] = "419-555-0000"
+    report = _run(settings, store, session, drifted, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert session.patches == []
+    assert "phone" in store.list_attempts(drifted.id)[-1].error_text
+
+
+def test_reparent_patch_is_exactly_parent_id(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1", **{fields.PARENT_ID: "OLD"}), "PARENT": _parent(), "OLD": _account("OLD")})
+    stored = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_REPARENT,
+            account_id="C1",
+            facility_url="https://example.test/a",
+            current_values={fields.PARENT_ID: "OLD"},
+            proposed_values={fields.PARENT_ID: "PARENT"},
+            evidence={},
+            confidence="high",
+        ),
+    )
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.applied == 1
+    assert session.patches == [("C1", {fields.PARENT_ID: "PARENT"})]
+    assert set(session.patches[0][1]) == {fields.PARENT_ID}
+
+    session.accounts["C1"][fields.PARENT_ID] = "OTHER"
+    moved = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_REPARENT,
+            account_id="C1",
+            facility_url="https://example.test/a",
+            current_values={fields.PARENT_ID: "OLD"},
+            proposed_values={fields.PARENT_ID: "PARENT"},
+            evidence={},
+            confidence="high",
+        ),
+    )
+    report = _run(settings, store, session, moved, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert len(session.patches) == 1
+
+
+def test_create_posts_safe_fields_and_does_not_repeat(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    proposed = {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine St",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44880",
+        fields.CARE_TYPE: "Memory Care",
+        fields.PHONE: "419-555-2222",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    stored = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_CREATE_ACCOUNT,
+            account_id=None,
+            facility_url="https://example.test/new",
+            current_values={},
+            proposed_values=proposed,
+            evidence={},
+            confidence="medium",
+        ),
+    )
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.applied == 1
+    assert len(session.posts) == 1
+    posted = session.posts[0]
+    assert posted[fields.CREATED_BY_CANDIDATE] is True
+    assert posted[fields.PARENT_ID] == "PARENT"
+    assert posted[fields.CARE_TYPE] == "Memory Care"
+    assert fields.LIFETIME_REVENUE not in posted
+    assert fields.OUTSTANDING_AR not in posted
+    assert fields.CHOW_CURRENT_ACCOUNT not in posted
+    assert fields.NOTE not in posted
+    assert fields.ACCOUNT_ID not in posted
+    created_id = store.successful_attempt(stored.id).created_account_id
+    assert created_id.startswith("NEW")
+
+    again = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert again.skipped_applied == 1
+    assert len(session.posts) == 1
+
+
+def test_create_recovers_one_tool_owned_account_and_stops_on_two(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    proposed = {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine St",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44880",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    owned = _account(
+        "OWN1",
+        **{
+            fields.NAME: "Brand New Place",
+            fields.STREET: "9 Pine St",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44880",
+            fields.PARENT_ID: "PARENT",
+            fields.CREATED_BY_CANDIDATE: True,
+        },
+    )
+    lookalike = _account(
+        "OLD",
+        **{
+            fields.NAME: "Brand New Place",
+            fields.STREET: "9 Pine St",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44880",
+            fields.CREATED_BY_CANDIDATE: False,
+        },
+    )
+    session = CrmFake({"PARENT": _parent(), "OWN1": owned, "OLD": lookalike})
+    stored = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_CREATE_ACCOUNT,
+            account_id=None,
+            facility_url="https://example.test/new",
+            current_values={},
+            proposed_values=proposed,
+            evidence={},
+            confidence="medium",
+        ),
+    )
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.applied == 1
+    assert session.posts == []
+    assert store.successful_attempt(stored.id).created_account_id == "OWN1"
+
+    second = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_CREATE_ACCOUNT,
+            account_id=None,
+            facility_url="https://example.test/new-2",
+            current_values={},
+            proposed_values=proposed,
+            evidence={},
+            confidence="medium",
+        ),
+    )
+    session.accounts["OWN2"] = _account(
+        "OWN2",
+        **{
+            fields.NAME: "Brand New Place",
+            fields.STREET: "9 Pine St",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44880",
+            fields.PARENT_ID: "PARENT",
+            fields.CREATED_BY_CANDIDATE: True,
+        },
+    )
+    report = _run(settings, store, session, second, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert session.posts == []
+
+
+def test_chow_posts_then_patches_only_the_link(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    old = _account(
+        "OLD1",
+        **{
+            fields.PARENT_ID: "WRONG",
+            fields.LIFETIME_REVENUE: 9000,
+            fields.OUTSTANDING_AR: 300,
+        },
+    )
+    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _account("WRONG")})
+    stored = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_CHOW,
+            account_id="OLD1",
+            facility_url="https://example.test/a",
+            current_values={
+                fields.PARENT_ID: "WRONG",
+                fields.NAME: old[fields.NAME],
+                fields.STREET: old[fields.STREET],
+                fields.CITY: old[fields.CITY],
+                fields.STATE: old[fields.STATE],
+                fields.ZIP: old[fields.ZIP],
+                fields.LIFETIME_REVENUE: 9000,
+                fields.OUTSTANDING_AR: 300,
+            },
+            proposed_values={
+                "new_account_parent_id": "PARENT",
+                "new_account_template": {
+                    fields.NAME: "Bellhaven of Tiffin",
+                    fields.STREET: "100 Main Street",
+                    fields.CITY: "Tiffin",
+                    fields.STATE: "OH",
+                    fields.ZIP: "44883",
+                    fields.PHONE: "419-555-0100",
+                    fields.CARE_TYPE: "Memory Care",
+                },
+                "old_account_patch": {fields.CHOW_CURRENT_ACCOUNT: "<new_account_id>"},
+                "old_account_unchanged": [fields.PARENT_ID, fields.STATUS, fields.NAME],
+            },
+            evidence={},
+            confidence="high",
+        ),
+    )
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.applied == 1
+    assert len(session.posts) == 1
+    assert session.posts[0][fields.PARENT_ID] == "PARENT"
+    assert session.posts[0][fields.CREATED_BY_CANDIDATE] is True
+    new_id = store.successful_attempt(stored.id).created_account_id
+    assert session.patches == [("OLD1", {fields.CHOW_CURRENT_ACCOUNT: new_id})]
+    assert list(session.patches[0][1]) == [fields.CHOW_CURRENT_ACCOUNT]
+    assert session.accounts["OLD1"][fields.PARENT_ID] == "WRONG"
+    assert session.accounts["OLD1"][fields.NAME] == old[fields.NAME]
+
+
+def test_chow_resume_does_not_post_twice_and_conflict_blocks(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    old = _account("OLD1", **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300})
+    session = CrmFake({"OLD1": old, "PARENT": _parent()})
+    session.patch_failures = 1
+    proposal = Proposal(
+        action_type=ACTION_CHOW,
+        account_id="OLD1",
+        facility_url="https://example.test/a",
+        current_values={
+            fields.PARENT_ID: "WRONG",
+            fields.LIFETIME_REVENUE: 9000,
+            fields.OUTSTANDING_AR: 300,
+        },
+        proposed_values={
+            "new_account_parent_id": "PARENT",
+            "new_account_template": {fields.NAME: "Bellhaven of Tiffin", fields.STREET: "100 Main Street"},
+            "old_account_patch": {fields.CHOW_CURRENT_ACCOUNT: "<new_account_id>"},
+        },
+        evidence={},
+        confidence="high",
+    )
+    stored = _approve(store, proposal)
+    first = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert first.failed == 1
+    assert len(session.posts) == 1
+    new_id = store.created_account_id_for_proposal(stored.id)
+    assert new_id
+    assert FAKE_TOKEN not in (store.list_attempts(stored.id)[-1].error_text or "")
+    assert store.successful_attempt(stored.id) is None
+
+    second = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert second.applied == 1
+    assert len(session.posts) == 1
+    assert session.patches[-1] == ( "OLD1", {fields.CHOW_CURRENT_ACCOUNT: new_id})
+
+    session.accounts["OLD1"][fields.CHOW_CURRENT_ACCOUNT] = "SOMEONE-ELSE"
+    store2_proposal = _approve(store, proposal)
+    store.record_attempt(
+        proposal_id=store2_proposal.id,
+        run_id=store2_proposal.run_id,
+        action_type=ACTION_CHOW,
+        mode=MODE_EXECUTE,
+        state=STATE_FAILED,
+        created_account_id="NEW-RECORDED",
+        error_text="previous link failed",
+    )
+    conflict = _run(settings, store, session, store2_proposal, execute=True, dry_run=False)
+    assert conflict.blocked == 1
+    assert len(session.posts) == 1
+    assert all(body.get(fields.CHOW_CURRENT_ACCOUNT) != "NEW-RECORDED" for _, body in session.patches)
+
+
+def test_chow_already_linked_is_complete_and_financial_drift_blocks(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    old = _account(
+        "OLD1",
+        **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300, fields.CHOW_CURRENT_ACCOUNT: "NEW1"},
+    )
+    session = CrmFake({"OLD1": old, "PARENT": _parent(), "NEW1": _account("NEW1", **{fields.CREATED_BY_CANDIDATE: True})})
+    stored = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_CHOW,
+            account_id="OLD1",
+            facility_url="https://example.test/a",
+            current_values={fields.PARENT_ID: "WRONG", fields.OUTSTANDING_AR: 300},
+            proposed_values={
+                "new_account_parent_id": "PARENT",
+                "new_account_template": {fields.NAME: "Bellhaven of Tiffin"},
+                "old_account_patch": {fields.CHOW_CURRENT_ACCOUNT: "<new_account_id>"},
+            },
+            evidence={},
+            confidence="high",
+        ),
+    )
+    store.record_attempt(
+        proposal_id=stored.id,
+        run_id=stored.run_id,
+        action_type=ACTION_CHOW,
+        mode=MODE_EXECUTE,
+        state=STATE_FAILED,
+        created_account_id="NEW1",
+        error_text="link uncertain",
+    )
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.applied == 1
+    assert session.posts == []
+    assert session.patches == []
+
+    drifted = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_CHOW,
+            account_id="OLD1",
+            facility_url="https://example.test/a",
+            current_values={fields.PARENT_ID: "WRONG", fields.OUTSTANDING_AR: 300, fields.LIFETIME_REVENUE: 9000},
+            proposed_values={
+                "new_account_parent_id": "PARENT",
+                "new_account_template": {fields.NAME: "Bellhaven of Tiffin"},
+                "old_account_patch": {fields.CHOW_CURRENT_ACCOUNT: "<new_account_id>"},
+            },
+            evidence={},
+            confidence="high",
+        ),
+    )
+    session.accounts["OLD1"][fields.CHOW_CURRENT_ACCOUNT] = ""
+    session.accounts["OLD1"][fields.OUTSTANDING_AR] = 1
+    report = _run(settings, store, session, drifted, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert session.posts == []
+
+
+def test_post_is_not_retried_and_error_is_redacted(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    session.post_failures = 1
+    stored = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_CREATE_ACCOUNT,
+            account_id=None,
+            facility_url="https://example.test/new",
+            current_values={},
+            proposed_values={
+                fields.NAME: "Brand New Place",
+                fields.PARENT_ID: "PARENT",
+                fields.STATUS: "Active",
+            },
+            evidence={},
+            confidence="medium",
+        ),
+    )
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.failed == 1
+    assert len(session.posts) == 1
+    error = store.list_attempts(stored.id)[-1].error_text or ""
+    assert FAKE_TOKEN not in error
+    assert "Not retrying" in error
+    assert store.list_attempts(stored.id)[-1].state == STATE_FAILED

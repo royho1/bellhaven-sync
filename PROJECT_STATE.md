@@ -94,8 +94,10 @@ Four branches, each reviewed and merged before the next starts:
 
 - Branch 1 `feat/schema-discovery` is merged to `main`.
 - Branch 2 `feat/scrape-and-match` is merged to `main` via PR #2 (`4cf89e7`).
-- Branch 3 `feat/proposals-and-review` is open as [PR #3](https://github.com/royho1/bellhaven-sync/pull/3).
-  **Do not merge until Codex is clean. Do not start Branch 4 yet.**
+- Branch 3 `feat/proposals-and-review` is merged to `main` via PR #3 (`4c90c07`).
+- Branch 4 `feat/apply-and-schedule` is the final write path. Do not merge it
+  until the Codex review on this branch is clean. Do not run live `--execute`
+  against the assessment API.
 - Branch 3 decisions:
   1. Explicit proposal action types in `proposals.py` (update/reparent/CHOW/create/
      ambiguous/duplicate/stale/chow-review/inactive-review/care-type-review).
@@ -146,9 +148,18 @@ Four branches, each reviewed and merged before the next starts:
   14. `normalize_name()` stays lossy for matching. Proposal name comparison uses
      `normalize_name_for_comparison()`, which keeps qualifiers such as Memory
      Care, Assisted Living, and parenthetical words.
-- Test suite on this branch: **137 passed**, fixture-based, no network required.
+  15. Apply lives only in `apply.py`, reached through `python -m bellhaven_sync.apply_cli`.
+     `crm_client.py` stays GET-only. `cli sync` and `scripts/run_scheduled_sync.sh`
+     cannot import the write path. Writes require an approved writable proposal,
+     a fresh CRM preflight, `DRY_RUN=false`, and `--execute`. Review-only actions
+     never write. CHOW POSTs a new account, stores that id, then PATCHes the old
+     account with only `chow_current_account`. A lost POST is not retried; the
+     next run reuses the stored id. Application attempts are a separate SQLite
+     table and do not overwrite approval status.
+- Test suite on this branch: **150 passed**, fixture-based, no live POST/PATCH.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
-- Next after a clean merge of PR #3: `feat/apply-and-schedule`.
+- Real-world limit: execute mode is implemented and tested with fake sessions
+  only. It has not been run against the assessment API.
 
 ## Open questions
 

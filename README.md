@@ -1,17 +1,14 @@
 # bellhaven-sync
 
-CRM reconciliation for Bellhaven Senior Living. The system scrapes Bellhaven's public
-website, reads the Clipboard CRM, proposes conservative corrections, and applies only
-what a human approves.
+Local reconciliation for Bellhaven Senior Living. The tool scrapes the public
+website, reads the Clipboard CRM, proposes conservative corrections, and writes
+only what a person has approved and then explicitly executed.
 
-Nothing is written to the CRM without an explicit approval. The scheduled job is
-read-only by construction: it cannot reach a write method.
+Scheduled runs stay read-only. Nothing in the sync path can POST or PATCH.
 
-## Status
-
-Phases 0-2 are merged (`schema-discovery`, `scrape-and-match`). Branch 3 adds
-proposal generation, SQLite persistence, `sync`, and a local Flask review UI.
-**Branch 3 performs no CRM writes.** Applying approved proposals is Branch 4.
+The public site `bellhavenseniorliving.com` does not currently resolve in DNS.
+Scrape behavior is covered by fixture HTML. A failed live scrape is not a
+product bug until the site resolves.
 
 ## Setup
 
@@ -21,38 +18,101 @@ python3 -m venv .venv
 cp .env.example .env    # then paste your token into .env
 ```
 
-`.env` is gitignored. The API token is read from the environment only. It is never
-committed, never logged, and never written into a snapshot or a document: everything
-that could carry it passes through `redact()` first.
+`.env` is gitignored. `CLIPBOARD_API_TOKEN` is read from the environment only.
+It is never committed, logged, or written into a snapshot. Anything that might
+carry it goes through `redact()` first.
 
-## Commands
+`DRY_RUN` defaults to true.
 
-```bash
-# Read-only: confirm the token, page through every account, print the observed
-# schema, and save a local snapshot under data/snapshots/.
-.venv/bin/python -m bellhaven_sync.cli discover
+## Workflow
 
-# Read-only: scrape Bellhaven's public site (listing + sitemap + facility pages).
-# Raises a completeness blocker when the union is short of the homepage claim.
-.venv/bin/python -m bellhaven_sync.cli scrape
+1. **Discover** the live account schema (read-only):
 
-# Read-only: scrape + CRM GET + match + generate proposals into SQLite.
-# Never POSTs or PATCHes the CRM.
-.venv/bin/python -m bellhaven_sync.cli sync
+   ```bash
+   .venv/bin/python -m bellhaven_sync.cli discover
+   ```
 
-# Local review UI, loopback only (127.0.0.1, localhost, or ::1).
-# Approve/reject updates SQLite only and requires the page CSRF token.
-# Never calls the CRM. Non-loopback hosts such as 0.0.0.0 are refused.
-.venv/bin/python -m bellhaven_sync.cli serve
-```
+2. **Scrape** the public site into a local facility list:
 
-## Proposal / review workflow
+   ```bash
+   .venv/bin/python -m bellhaven_sync.cli scrape
+   ```
 
-1. Run `sync` to scrape the site, read CRM accounts, match, and persist proposals
-   under `data/bellhaven_sync.db`.
-2. Run `serve` and open `http://127.0.0.1:5055`. The server refuses non-loopback binds.
-3. Filter by status / action type, then Approve or Reject. Those posts carry a session CSRF token.
-4. Decisions stay in SQLite. Branch 4 will apply only approved items.
+3. **Sync** scrapes, reads the CRM, matches, and stores proposals in SQLite.
+   This command never writes to the CRM.
+
+   ```bash
+   .venv/bin/python -m bellhaven_sync.cli sync
+   ```
+
+4. **Review** in the local UI. The server binds loopback only
+   (`127.0.0.1`, `localhost`, or `::1`). Approve and reject update SQLite and
+   require the page's CSRF token.
+
+   ```bash
+   .venv/bin/python -m bellhaven_sync.cli serve
+   ```
+
+   Open `http://127.0.0.1:5055`.
+
+5. **Plan writes.** This prints the plan and performs zero POST/PATCH calls:
+
+   ```bash
+   .venv/bin/python -m bellhaven_sync.apply_cli
+   ```
+
+6. **Execute writes** only when both gates are open. `--execute` while
+   `DRY_RUN` is still true is refused.
+
+   ```bash
+   DRY_RUN=false .venv/bin/python -m bellhaven_sync.apply_cli --execute
+   ```
+
+   Optional: `--run-id` chooses a reconciliation run (default is the latest)
+   and `--proposal-id` applies one approved proposal from that run.
+
+7. **Schedule** the read-only sync. See `docs/scheduling.md`. The sample cron
+   line is an example, not a required cadence, and it is not installed for you.
+
+## What apply will write
+
+Only approved proposals of these types, and only after a fresh CRM read still
+matches the values that were reviewed:
+
+| Action | CRM call |
+| --- | --- |
+| `update_fields` | PATCH the approved name, address, care type, or phone fields |
+| `reparent` | PATCH exactly `{"parent_id": "..."}` |
+| `create_account` | POST a new child with `created_by_candidate=true` |
+| `chow_create_and_link` | POST a new account, then PATCH the old account with only `chow_current_account` |
+
+Review-only types (`review_ambiguous`, `review_duplicate`,
+`review_stale_or_missing`, `review_chow_ambiguous`, `review_inactive_account`,
+`review_care_type`) never write, even if marked approved.
+
+If a reviewed field changed in the CRM, apply stops that proposal and asks for
+a new sync plus review. It does not edit the proposal.
+
+CHOW saves the new account id before linking the old account. If the link
+fails, the next execute reuses that id and does not POST again. If the old
+account is already linked to that id, apply treats the CHOW as done. If it
+points somewhere else, apply stops.
+
+Approval status stays `approved`. Application results live in
+`application_attempts` (planned, in progress, applied, blocked, or failed).
+
+## Architecture / safety decisions
+
+- `crm_client.py` is GET-only and stays that way. POST and PATCH exist only in
+  `apply.py`.
+- `python -m bellhaven_sync.cli sync` cannot import `apply.py`. The write
+  command is a separate module, `apply_cli`.
+- The scheduled shell script calls `cli sync` only.
+- `tests/test_write_boundary.py` checks both the import graph and that no other
+  module issues POST/PATCH.
+- Two gates sit in front of a write: `DRY_RUN=false` and `--execute`.
+- POST is not retried. A timeout can mean the account was created.
+- The token is registered for redaction as soon as settings are loaded.
 
 ## Tests
 
@@ -60,20 +120,9 @@ that could carry it passes through `redact()` first.
 .venv/bin/python -m pytest
 ```
 
-Tests never touch the network. HTTP is stubbed with a fake session that only
-implements `get`.
-
-## Safety model
-
-- `bellhaven_sync/crm_client.py` is GET-only and stays that way.
-- All POST and PATCH capability will live in `bellhaven_sync/apply.py`, which the
-  sync path never imports. `tests/test_write_boundary.py` walks the transitive import
-  graph and fails if that ever changes.
-- The CHOW rule (change of ownership) is isolated in `chow.py` so it can be read
-  and verified in one screen.
-- Branch 3 (`sync` / `serve` / proposals / store / review UI) never writes to the CRM.
+Tests never call the live CRM. HTTP is stubbed.
 
 ## Docs
 
-- `docs/schema-findings.md`: what the live API actually returns, observed rather than
-  assumed, since the OpenAPI spec leaves the account schema empty.
+- `docs/schema-findings.md`: what the live API actually returns.
+- `docs/scheduling.md`: the read-only cron example and the human apply step.

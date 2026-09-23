@@ -46,6 +46,23 @@ CREATE TABLE IF NOT EXISTS proposals (
 CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
 CREATE INDEX IF NOT EXISTS idx_proposals_action ON proposals(action_type);
 CREATE INDEX IF NOT EXISTS idx_proposals_run ON proposals(run_id);
+
+CREATE TABLE IF NOT EXISTS application_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id INTEGER NOT NULL,
+    run_id INTEGER NOT NULL,
+    action_type TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_account_id TEXT,
+    error_text TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    FOREIGN KEY (proposal_id) REFERENCES proposals(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_application_attempts_proposal
+    ON application_attempts(proposal_id);
 """
 
 
@@ -61,6 +78,34 @@ def _loads(raw: str | None) -> Any:
     if not raw:
         return {}
     return json.loads(raw)
+
+
+MODE_DRY_RUN = "dry_run"
+MODE_EXECUTE = "execute"
+STATE_PLANNED = "planned"
+STATE_IN_PROGRESS = "in_progress"
+STATE_APPLIED = "applied"
+STATE_BLOCKED = "blocked"
+STATE_FAILED = "failed"
+
+ATTEMPT_MODES = frozenset({MODE_DRY_RUN, MODE_EXECUTE})
+ATTEMPT_STATES = frozenset(
+    {STATE_PLANNED, STATE_IN_PROGRESS, STATE_APPLIED, STATE_BLOCKED, STATE_FAILED}
+)
+
+
+@dataclass(frozen=True)
+class ApplicationAttempt:
+    id: int
+    proposal_id: int
+    run_id: int
+    action_type: str
+    mode: str
+    state: str
+    created_account_id: str | None
+    error_text: str | None
+    started_at: str
+    finished_at: str | None
 
 
 @dataclass(frozen=True)
@@ -224,6 +269,131 @@ class ProposalStore:
             for row in rows
         ]
 
+    def record_attempt(
+        self,
+        *,
+        proposal_id: int,
+        run_id: int,
+        action_type: str,
+        mode: str,
+        state: str,
+        created_account_id: str | None = None,
+        error_text: str | None = None,
+    ) -> ApplicationAttempt:
+        if mode not in ATTEMPT_MODES:
+            raise ValueError(f"invalid application mode {mode!r}")
+        if state not in ATTEMPT_STATES:
+            raise ValueError(f"invalid application state {state!r}")
+        started = _now()
+        finished = started if state != STATE_IN_PROGRESS else None
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO application_attempts (
+                    proposal_id, run_id, action_type, mode, state,
+                    created_account_id, error_text, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proposal_id,
+                    run_id,
+                    action_type,
+                    mode,
+                    state,
+                    created_account_id,
+                    error_text,
+                    started,
+                    finished,
+                ),
+            )
+            attempt_id = int(cur.lastrowid)
+            conn.commit()
+        attempt = self.get_attempt(attempt_id)
+        assert attempt is not None
+        return attempt
+
+    def update_attempt(
+        self,
+        attempt_id: int,
+        *,
+        state: str,
+        created_account_id: str | None = None,
+        error_text: str | None = None,
+    ) -> ApplicationAttempt:
+        if state not in ATTEMPT_STATES:
+            raise ValueError(f"invalid application state {state!r}")
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE application_attempts
+                SET state = ?,
+                    created_account_id = COALESCE(?, created_account_id),
+                    error_text = COALESCE(?, error_text),
+                    finished_at = ?
+                WHERE id = ?
+                """,
+                (state, created_account_id, error_text, _now(), attempt_id),
+            )
+            if cur.rowcount != 1:
+                raise KeyError(f"application attempt {attempt_id} not found")
+            conn.commit()
+        attempt = self.get_attempt(attempt_id)
+        assert attempt is not None
+        return attempt
+
+    def get_attempt(self, attempt_id: int) -> ApplicationAttempt | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM application_attempts WHERE id = ?",
+                (attempt_id,),
+            ).fetchone()
+        return self._row_to_attempt(row) if row else None
+
+    def list_attempts(self, proposal_id: int) -> list[ApplicationAttempt]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM application_attempts
+                WHERE proposal_id = ?
+                ORDER BY id
+                """,
+                (proposal_id,),
+            ).fetchall()
+        return [self._row_to_attempt(row) for row in rows]
+
+    def successful_attempt(self, proposal_id: int) -> ApplicationAttempt | None:
+        """An execute-mode attempt that finished applied. Dry-run plans do not count."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM application_attempts
+                WHERE proposal_id = ? AND mode = ? AND state = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (proposal_id, MODE_EXECUTE, STATE_APPLIED),
+            ).fetchone()
+        return self._row_to_attempt(row) if row else None
+
+    def created_account_id_for_proposal(self, proposal_id: int) -> str | None:
+        """Newest execute-mode account id, including a failed attempt after a successful POST."""
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT created_account_id FROM application_attempts
+                WHERE proposal_id = ?
+                  AND mode = ?
+                  AND created_account_id IS NOT NULL
+                  AND created_account_id != ''
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (proposal_id, MODE_EXECUTE),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["created_account_id"])
+
     def action_types(self, *, run_id: int | None = None) -> list[str]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -237,6 +407,24 @@ class ProposalStore:
                 params,
             ).fetchall()
         return [str(row["action_type"]) for row in rows]
+
+    @staticmethod
+    def _row_to_attempt(row: sqlite3.Row) -> ApplicationAttempt:
+        created = row["created_account_id"]
+        error = row["error_text"]
+        finished = row["finished_at"]
+        return ApplicationAttempt(
+            id=int(row["id"]),
+            proposal_id=int(row["proposal_id"]),
+            run_id=int(row["run_id"]),
+            action_type=str(row["action_type"]),
+            mode=str(row["mode"]),
+            state=str(row["state"]),
+            created_account_id=str(created) if created else None,
+            error_text=str(error) if error else None,
+            started_at=str(row["started_at"]),
+            finished_at=str(finished) if finished else None,
+        )
 
     @staticmethod
     def _row_to_proposal(row: sqlite3.Row) -> StoredProposal:
