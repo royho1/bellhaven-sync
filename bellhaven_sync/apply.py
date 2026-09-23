@@ -18,6 +18,13 @@ import requests
 
 from . import crm_client, fields
 from .config import DEFAULT_TIMEOUT, Settings, redact
+from .normalize import (
+    normalize_city,
+    normalize_name,
+    normalize_state,
+    normalize_street,
+    normalize_zip,
+)
 from .proposals import (
     ACTION_CHOW,
     ACTION_CREATE_ACCOUNT,
@@ -35,6 +42,7 @@ from .store import (
     CLAIM_ALREADY_APPLIED,
     CLAIM_CLAIMED,
     CLAIM_IN_PROGRESS,
+    CLAIM_NOT_APPROVED,
     MODE_DRY_RUN,
     MODE_EXECUTE,
     STATE_APPLIED,
@@ -82,6 +90,9 @@ IN_PROGRESS_CLAIM_MESSAGE = (
 CREATE_IDENTITY_BUSY_MESSAGE = (
     "Another execute attempt is already creating an account with this identity. "
     "Refusing a concurrent create until the prior attempt finishes or is reconciled."
+)
+NOT_APPROVED_CLAIM_MESSAGE = (
+    "Proposal is no longer approved. Refusing execute; no CRM write."
 )
 
 
@@ -263,6 +274,12 @@ def _consider(
         run_id=proposal.run_id,
         action_type=proposal.action_type,
     )
+    if claim.status == CLAIM_NOT_APPROVED:
+        report.skipped_not_approved += 1
+        report.notes.append(
+            f"#{proposal.id} {proposal.action_type}: skipped: {NOT_APPROVED_CLAIM_MESSAGE}"
+        )
+        return
     if claim.status == CLAIM_ALREADY_APPLIED:
         report.skipped_applied += 1
         report.notes.append(f"#{proposal.id} {proposal.action_type}: already applied")
@@ -606,6 +623,27 @@ def _evidence_text(value: Any) -> str | None:
     return text if text else None
 
 
+def _canonical_identity_value(key: str, value: Any) -> str | None:
+    """Canonicalize one identity field, or None when evidence is blank/unavailable."""
+    if _evidence_text(value) is None:
+        return None
+    raw = str(value)
+    if key == fields.NAME:
+        canon = normalize_name(raw)
+    elif key == fields.STREET:
+        house, street = normalize_street(raw)
+        canon = f"{house} {street}".strip()
+    elif key == fields.CITY:
+        canon = normalize_city(raw)
+    elif key == fields.STATE:
+        canon = normalize_state(raw)
+    elif key == fields.ZIP:
+        canon = normalize_zip(raw)
+    else:
+        canon = raw.strip()
+    return canon if canon else None
+
+
 def _create_identity_key(body: dict[str, Any]) -> str:
     """Normalized create identity for cross-proposal execute serialization."""
     parent = str(body.get(fields.PARENT_ID) or "").strip()
@@ -613,7 +651,7 @@ def _create_identity_key(body: dict[str, Any]) -> str:
     for key in CREATE_IDENTITY_FIELDS:
         if key not in body:
             continue
-        value = _evidence_text(body.get(key))
+        value = _canonical_identity_value(key, body.get(key))
         if value is None:
             continue
         parts.append(f"{key}={value}")
@@ -637,7 +675,7 @@ def _claim_create_identity(
 
 
 def _same_identity(account: dict[str, Any], body: dict[str, Any]) -> bool:
-    """Stable create/recovery identity: name and address only. Phone is ignored.
+    """Stable create/recovery identity: canonical name and address only. Phone ignored.
 
     Blank or whitespace-only proposed fields are unavailable evidence and are
     skipped, so a missing city/ZIP does not reject an otherwise matching account.
@@ -646,11 +684,12 @@ def _same_identity(account: dict[str, Any], body: dict[str, Any]) -> bool:
     for key in CREATE_IDENTITY_FIELDS:
         if key not in body:
             continue
-        proposed = _evidence_text(body.get(key))
+        proposed = _canonical_identity_value(key, body.get(key))
         if proposed is None:
             continue
         compared = True
-        if not _same(proposed, account.get(key)):
+        live = _canonical_identity_value(key, account.get(key))
+        if live is None or live != proposed:
             return False
     return compared
 

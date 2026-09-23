@@ -184,10 +184,16 @@ Four branches, each reviewed and merged before the next starts:
      proposed address fields are skipped as unavailable evidence, so a missing
      city/ZIP cannot reject an otherwise matching CRM account.
   21. Create and CHOW create paths also take an atomic `create_identity_locks`
-     reservation (parent + non-blank identity fields) while the attempt is
-     `in_progress`, so two different proposal IDs for the same facility cannot
-     both POST. The lock is released when the attempt leaves `in_progress`.
-- Test suite on this branch: **168 passed**, fixture-based, no live POST/PATCH.
+     reservation (parent + canonical non-blank identity fields) while an attempt
+     is `in_progress` or `uncertain`, so two different proposal IDs for the same
+     facility cannot both POST. The same proposal may transfer the reservation
+     onto a newer attempt during uncertain recovery. The lock is released only on
+     applied/blocked/failed.
+  22. Create identity keys and `_same_identity` use `normalize_name` /
+     `normalize_street` / `normalize_city` / `normalize_state` / `normalize_zip`.
+  23. `claim_execute_attempt` re-reads proposal status under `BEGIN IMMEDIATE`
+     and refuses with `CLAIM_NOT_APPROVED` if the proposal is no longer approved.
+- Test suite on this branch: **172 passed**, fixture-based, no live POST/PATCH.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
 - Real-world limit: execute mode is implemented and tested with fake sessions
   only. It has not been run against the assessment API.

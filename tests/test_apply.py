@@ -27,6 +27,7 @@ from bellhaven_sync.store import (
     CLAIM_ALREADY_APPLIED,
     CLAIM_CLAIMED,
     CLAIM_IN_PROGRESS,
+    CLAIM_NOT_APPROVED,
     MODE_DRY_RUN,
     MODE_EXECUTE,
     STATE_APPLIED,
@@ -1325,3 +1326,174 @@ def test_same_create_identity_blocks_second_proposal_from_posting(settings, tmp_
     error = store.list_attempts(second.id)[-1].error_text or ""
     assert "already creating an account with this identity" in error
     assert store.list_attempts(first.id)[-1].state == STATE_IN_PROGRESS
+
+
+def test_uncertain_create_keeps_identity_lock_against_other_proposal(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    session.post_failures = 1
+    proposed = {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine St",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44880",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    first, second = _approve_many(store, _create_proposal(proposed), _create_proposal(proposed))
+
+    first_report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=first.run_id,
+        proposal_id=first.id,
+        execute=True,
+    )
+    assert first_report.failed == 1
+    assert store.list_attempts(first.id)[-1].state == STATE_UNCERTAIN
+    assert len(session.posts) == 1
+
+    second_report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=second.run_id,
+        proposal_id=second.id,
+        execute=True,
+    )
+    assert second_report.blocked == 1
+    assert len(session.posts) == 1
+    error = store.list_attempts(second.id)[-1].error_text or ""
+    assert "already creating an account with this identity" in error
+
+
+def test_original_proposal_recovers_after_uncertain_create(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    session.lose_post_response = 1
+    proposed = {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine St",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44880",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    stored = _approve(store, _create_proposal(proposed))
+
+    first = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert first.failed == 1
+    assert store.has_uncertain_attempt(stored.id)
+    assert len(session.posts) == 1
+    recovered_id = next(aid for aid in session.accounts if aid.startswith("NEW"))
+
+    second = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert second.applied == 1
+    assert len(session.posts) == 1
+    assert store.successful_attempt(stored.id).created_account_id == recovered_id
+
+
+def test_equivalent_street_formatting_shares_create_identity(settings, tmp_path):
+    from bellhaven_sync import apply as apply_mod
+
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    first_body = {
+        fields.NAME: "Bellhaven of Tiffin",
+        fields.STREET: "100 Main Street",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44883",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    second_body = {
+        fields.NAME: "Bellhaven of Tiffin",
+        fields.STREET: "100 Main St.",
+        fields.CITY: "Tiffin",
+        fields.STATE: "oh",
+        fields.ZIP: "44883-1234",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    assert apply_mod._create_identity_key({**first_body, fields.CREATED_BY_CANDIDATE: True}) == (
+        apply_mod._create_identity_key({**second_body, fields.CREATED_BY_CANDIDATE: True})
+    )
+    owned = _account(
+        "OWN1",
+        **{
+            fields.NAME: "Bellhaven of Tiffin",
+            fields.STREET: "100 Main Street",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44883",
+            fields.PARENT_ID: "PARENT",
+            fields.CREATED_BY_CANDIDATE: True,
+        },
+    )
+    session.accounts["OWN1"] = owned
+    stored = _approve(store, _create_proposal(second_body))
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.applied == 1
+    assert session.posts == []
+    assert store.successful_attempt(stored.id).created_account_id == "OWN1"
+
+    outsider = _account(
+        "OUT1",
+        **{
+            fields.NAME: "Bellhaven of Tiffin",
+            fields.STREET: "100 Main St",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44883",
+            fields.PARENT_ID: "PARENT",
+            fields.CREATED_BY_CANDIDATE: False,
+        },
+    )
+    store2 = ProposalStore(tmp_path / "db2.sqlite")
+    session2 = CrmFake({"PARENT": _parent(), "OUT1": outsider})
+    blocked = _approve(store2, _create_proposal(first_body))
+    blocked_report = _run(settings, store2, session2, blocked, execute=True, dry_run=False)
+    assert blocked_report.blocked == 1
+    assert session2.posts == []
+
+
+def test_claim_refuses_when_approval_revoked_before_execute(settings, tmp_path):
+    from bellhaven_sync.apply import ApplyReport, _consider
+
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    stored = _approve(store, _create_proposal())
+    assert stored.status == STATUS_APPROVED
+
+    # Review UI rejects after apply already loaded an approved snapshot.
+    store.set_status(stored.id, STATUS_REJECTED)
+    claim = store.claim_execute_attempt(
+        proposal_id=stored.id,
+        run_id=stored.run_id,
+        action_type=ACTION_CREATE_ACCOUNT,
+    )
+    assert claim.status == CLAIM_NOT_APPROVED
+    assert claim.attempt is None
+    assert store.list_attempts(stored.id) == []
+
+    # Stale in-memory approved proposal must still fail closed with zero writes.
+    report = ApplyReport(run_id=stored.run_id, mode=MODE_EXECUTE)
+    _consider(
+        stored,
+        report,
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        execute=True,
+    )
+    assert report.skipped_not_approved == 1
+    assert report.applied == 0
+    assert report.writable == 0
+    assert session.posts == []
+    assert session.patches == []
+    assert store.list_attempts(stored.id) == []
+    assert any("no longer approved" in note for note in report.notes)

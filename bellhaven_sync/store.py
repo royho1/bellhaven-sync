@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .proposals import STATUS_VALUES, Proposal, ProposalBatch
+from .proposals import STATUS_APPROVED, STATUS_VALUES, Proposal, ProposalBatch
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS reconciliation_runs (
@@ -105,6 +105,12 @@ STATE_UNCERTAIN = "uncertain"
 CLAIM_CLAIMED = "claimed"
 CLAIM_ALREADY_APPLIED = "already_applied"
 CLAIM_IN_PROGRESS = "in_progress"
+CLAIM_NOT_APPROVED = "not_approved"
+
+# Leave create-identity locks in place for uncertain writes; release only when safe.
+_CREATE_IDENTITY_RELEASE_STATES = frozenset(
+    {STATE_APPLIED, STATE_BLOCKED, STATE_FAILED}
+)
 
 ATTEMPT_MODES = frozenset({MODE_DRY_RUN, MODE_EXECUTE})
 ATTEMPT_STATES = frozenset(
@@ -360,6 +366,14 @@ class ProposalStore:
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            proposal_row = conn.execute(
+                "SELECT status FROM proposals WHERE id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if proposal_row is None or str(proposal_row["status"]) != STATUS_APPROVED:
+                conn.commit()
+                return ClaimResult(CLAIM_NOT_APPROVED, None)
+
             applied = conn.execute(
                 """
                 SELECT * FROM application_attempts
@@ -424,10 +438,11 @@ class ProposalStore:
         proposal_id: int,
         attempt_id: int,
     ) -> bool:
-        """Reserve a normalized create identity for one in-progress execute attempt.
+        """Reserve a normalized create identity across proposals.
 
-        Returns True if this attempt holds the lock. Returns False if another
-        proposal/attempt already holds it. Re-claiming the same attempt_id is OK.
+        Returns True if this attempt holds the lock. The same proposal may transfer
+        an existing reservation onto a newer attempt (uncertain-write recovery).
+        A different proposal cannot take the lock while it is held.
         """
         if not identity_key:
             raise ValueError("create identity key is required")
@@ -440,7 +455,20 @@ class ProposalStore:
                 (identity_key,),
             ).fetchone()
             if row is not None:
-                if int(row["attempt_id"]) == attempt_id:
+                holder_proposal = int(row["proposal_id"])
+                holder_attempt = int(row["attempt_id"])
+                if holder_attempt == attempt_id:
+                    conn.commit()
+                    return True
+                if holder_proposal == proposal_id:
+                    conn.execute(
+                        """
+                        UPDATE create_identity_locks
+                        SET attempt_id = ?, claimed_at = ?
+                        WHERE identity_key = ?
+                        """,
+                        (attempt_id, claimed_at, identity_key),
+                    )
                     conn.commit()
                     return True
                 conn.commit()
@@ -493,7 +521,7 @@ class ProposalStore:
             )
             if cur.rowcount != 1:
                 raise KeyError(f"application attempt {attempt_id} not found")
-            if state != STATE_IN_PROGRESS:
+            if state in _CREATE_IDENTITY_RELEASE_STATES:
                 conn.execute(
                     "DELETE FROM create_identity_locks WHERE attempt_id = ?",
                     (attempt_id,),
