@@ -32,6 +32,9 @@ from .proposals import (
     SUPPORTED_CARE_TYPES,
 )
 from .store import (
+    CLAIM_ALREADY_APPLIED,
+    CLAIM_CLAIMED,
+    CLAIM_IN_PROGRESS,
     MODE_DRY_RUN,
     MODE_EXECUTE,
     STATE_APPLIED,
@@ -71,6 +74,11 @@ UPDATE_FIELDS_ALLOW = frozenset(
 CREATE_FIELDS_ALLOW = UPDATE_FIELDS_ALLOW | {fields.PARENT_ID, fields.STATUS}
 CREATE_STATUS_ALLOW = frozenset({fields.STATUS_ACTIVE, fields.STATUS_INACTIVE})
 SUPPORTED_CARE = frozenset(SUPPORTED_CARE_TYPES)
+CREATE_IDENTITY_FIELDS = (fields.NAME, fields.STREET, fields.CITY, fields.STATE, fields.ZIP)
+IN_PROGRESS_CLAIM_MESSAGE = (
+    "A previous execute attempt is still in_progress. It may have been interrupted "
+    "after a CRM write. Refusing another execution until the prior attempt is reconciled."
+)
 
 
 class ApplyError(RuntimeError):
@@ -198,27 +206,27 @@ def _consider(
             note=f"#{proposal.id}: unknown action {proposal.action_type!r}; fail closed",
         )
         return
-    if store.successful_attempt(proposal.id) is not None:
-        report.skipped_applied += 1
-        report.notes.append(f"#{proposal.id} {proposal.action_type}: already applied")
-        return
 
-    report.writable += 1
     posts, patches = _planned_calls(proposal.action_type)
-    try:
-        _validate_payload(proposal)
-    except ApplyError as exc:
-        _record_terminal(
-            store,
-            proposal,
-            report,
-            execute=execute,
-            state=STATE_BLOCKED,
-            note=f"#{proposal.id} {proposal.action_type}: blocked: {exc}",
-        )
-        return
 
     if not execute:
+        if store.successful_attempt(proposal.id) is not None:
+            report.skipped_applied += 1
+            report.notes.append(f"#{proposal.id} {proposal.action_type}: already applied")
+            return
+        try:
+            _validate_payload(proposal)
+        except ApplyError as exc:
+            _record_terminal(
+                store,
+                proposal,
+                report,
+                execute=False,
+                state=STATE_BLOCKED,
+                note=f"#{proposal.id} {proposal.action_type}: blocked: {exc}",
+            )
+            return
+        report.writable += 1
         report.planned_posts += posts
         report.planned_patches += patches
         store.record_attempt(
@@ -233,15 +241,41 @@ def _consider(
         )
         return
 
-    report.planned_posts += posts
-    report.planned_patches += patches
-    attempt = store.record_attempt(
+    try:
+        _validate_payload(proposal)
+    except ApplyError as exc:
+        _record_terminal(
+            store,
+            proposal,
+            report,
+            execute=True,
+            state=STATE_BLOCKED,
+            note=f"#{proposal.id} {proposal.action_type}: blocked: {exc}",
+        )
+        return
+
+    claim = store.claim_execute_attempt(
         proposal_id=proposal.id,
         run_id=proposal.run_id,
         action_type=proposal.action_type,
-        mode=MODE_EXECUTE,
-        state=STATE_IN_PROGRESS,
     )
+    if claim.status == CLAIM_ALREADY_APPLIED:
+        report.skipped_applied += 1
+        report.notes.append(f"#{proposal.id} {proposal.action_type}: already applied")
+        return
+    if claim.status == CLAIM_IN_PROGRESS:
+        report.blocked += 1
+        report.notes.append(f"#{proposal.id} {proposal.action_type}: blocked: {IN_PROGRESS_CLAIM_MESSAGE}")
+        return
+    if claim.status != CLAIM_CLAIMED or claim.attempt is None:
+        report.blocked += 1
+        report.notes.append(f"#{proposal.id} {proposal.action_type}: blocked: execute claim failed")
+        return
+
+    report.writable += 1
+    report.planned_posts += posts
+    report.planned_patches += patches
+    attempt = claim.attempt
     try:
         created = _execute(proposal, settings=settings, store=store, session=session, attempt_id=attempt.id)
     except ApplyError as exc:
@@ -552,8 +586,9 @@ def _resolve_create_id(
 
 
 def _same_identity(account: dict[str, Any], body: dict[str, Any]) -> bool:
+    """Stable create/recovery identity: name and address only. Phone is ignored."""
     compared = False
-    for key in (fields.NAME, fields.STREET, fields.CITY, fields.STATE, fields.ZIP, fields.PHONE):
+    for key in CREATE_IDENTITY_FIELDS:
         if key not in body:
             continue
         compared = True

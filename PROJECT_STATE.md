@@ -173,7 +173,16 @@ Four branches, each reviewed and merged before the next starts:
      only. The attempt ends blocked; later approved proposals in the same
      `run_apply()` invocation are still considered. No POST/PATCH on an untrusted
      scan.
-- Test suite on this branch: **159 passed**, fixture-based, no live POST/PATCH.
+  19. Execute mode atomically claims a proposal in SQLite (`BEGIN IMMEDIATE` via
+     `claim_execute_attempt`) before any CRM write. A partial unique index allows
+     only one execute-mode `in_progress` attempt per proposal. Concurrent callers
+     and orphaned `in_progress` rows fail closed without a second POST/PATCH,
+     because a prior process may already have written to the CRM. No time-based
+     lock expiry and no silent claim takeover.
+  20. Create duplicate/recovery identity (`_same_identity`) uses stable name and
+     billing address fields only. Phone is ignored so blank proposed phones cannot
+     miss an otherwise exact CRM account.
+- Test suite on this branch: **165 passed**, fixture-based, no live POST/PATCH.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
 - Real-world limit: execute mode is implemented and tested with fake sessions
   only. It has not been run against the assessment API.

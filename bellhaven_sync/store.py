@@ -63,6 +63,10 @@ CREATE TABLE IF NOT EXISTS application_attempts (
 
 CREATE INDEX IF NOT EXISTS idx_application_attempts_proposal
     ON application_attempts(proposal_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_application_attempts_one_execute_in_progress
+    ON application_attempts(proposal_id)
+    WHERE mode = 'execute' AND state = 'in_progress';
 """
 
 
@@ -89,6 +93,10 @@ STATE_BLOCKED = "blocked"
 STATE_FAILED = "failed"
 STATE_UNCERTAIN = "uncertain"
 
+CLAIM_CLAIMED = "claimed"
+CLAIM_ALREADY_APPLIED = "already_applied"
+CLAIM_IN_PROGRESS = "in_progress"
+
 ATTEMPT_MODES = frozenset({MODE_DRY_RUN, MODE_EXECUTE})
 ATTEMPT_STATES = frozenset(
     {
@@ -100,6 +108,12 @@ ATTEMPT_STATES = frozenset(
         STATE_UNCERTAIN,
     }
 )
+
+
+@dataclass(frozen=True)
+class ClaimResult:
+    status: str
+    attempt: ApplicationAttempt | None = None
 
 
 @dataclass(frozen=True)
@@ -319,6 +333,80 @@ class ProposalStore:
         attempt = self.get_attempt(attempt_id)
         assert attempt is not None
         return attempt
+
+    def claim_execute_attempt(
+        self,
+        *,
+        proposal_id: int,
+        run_id: int,
+        action_type: str,
+    ) -> ClaimResult:
+        """Atomically claim a proposal for execute mode, or report why it cannot run.
+
+        Uses ``BEGIN IMMEDIATE`` so two processes cannot both insert ``in_progress``.
+        An existing ``in_progress`` row is never overwritten: it may already have
+        written to the CRM.
+        """
+        started = _now()
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            applied = conn.execute(
+                """
+                SELECT * FROM application_attempts
+                WHERE proposal_id = ? AND mode = ? AND state = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (proposal_id, MODE_EXECUTE, STATE_APPLIED),
+            ).fetchone()
+            if applied is not None:
+                conn.commit()
+                return ClaimResult(CLAIM_ALREADY_APPLIED, self._row_to_attempt(applied))
+
+            busy = conn.execute(
+                """
+                SELECT * FROM application_attempts
+                WHERE proposal_id = ? AND mode = ? AND state = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (proposal_id, MODE_EXECUTE, STATE_IN_PROGRESS),
+            ).fetchone()
+            if busy is not None:
+                conn.commit()
+                return ClaimResult(CLAIM_IN_PROGRESS, self._row_to_attempt(busy))
+
+            cur = conn.execute(
+                """
+                INSERT INTO application_attempts (
+                    proposal_id, run_id, action_type, mode, state,
+                    created_account_id, error_text, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proposal_id,
+                    run_id,
+                    action_type,
+                    MODE_EXECUTE,
+                    STATE_IN_PROGRESS,
+                    None,
+                    None,
+                    started,
+                    None,
+                ),
+            )
+            attempt_id = int(cur.lastrowid)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        attempt = self.get_attempt(attempt_id)
+        assert attempt is not None
+        return ClaimResult(CLAIM_CLAIMED, attempt)
 
     def update_attempt(
         self,

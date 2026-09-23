@@ -24,6 +24,9 @@ from bellhaven_sync.proposals import (
     ProposalBatch,
 )
 from bellhaven_sync.store import (
+    CLAIM_ALREADY_APPLIED,
+    CLAIM_CLAIMED,
+    CLAIM_IN_PROGRESS,
     MODE_DRY_RUN,
     MODE_EXECUTE,
     STATE_APPLIED,
@@ -1046,3 +1049,167 @@ def test_mixed_tool_and_non_tool_matches_block_create(settings, tmp_path):
     assert store.created_account_id_for_proposal(stored.id) is None
     error = store.list_attempts(stored.id)[-1].error_text or ""
     assert "not created by this tool" in error
+
+
+def test_claim_execute_attempt_is_atomic_across_store_handles(tmp_path):
+    db = tmp_path / "db.sqlite"
+    store_a = ProposalStore(db)
+    store_b = ProposalStore(db)
+    stored = _approve(store_a, _create_proposal())
+
+    first = store_a.claim_execute_attempt(
+        proposal_id=stored.id,
+        run_id=stored.run_id,
+        action_type=ACTION_CREATE_ACCOUNT,
+    )
+    second = store_b.claim_execute_attempt(
+        proposal_id=stored.id,
+        run_id=stored.run_id,
+        action_type=ACTION_CREATE_ACCOUNT,
+    )
+    assert first.status == CLAIM_CLAIMED
+    assert first.attempt is not None
+    assert first.attempt.state == STATE_IN_PROGRESS
+    assert second.status == CLAIM_IN_PROGRESS
+    assert second.attempt is not None
+    assert second.attempt.id == first.attempt.id
+
+    attempts = store_a.list_attempts(stored.id)
+    in_progress = [item for item in attempts if item.state == STATE_IN_PROGRESS]
+    assert len(in_progress) == 1
+
+    again = store_b.claim_execute_attempt(
+        proposal_id=stored.id,
+        run_id=stored.run_id,
+        action_type=ACTION_CREATE_ACCOUNT,
+    )
+    assert again.status == CLAIM_IN_PROGRESS
+    assert len([item for item in store_a.list_attempts(stored.id) if item.state == STATE_IN_PROGRESS]) == 1
+
+
+def test_orphaned_in_progress_attempt_blocks_execute_without_write(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    stored = _approve(store, _create_proposal())
+    orphan = store.record_attempt(
+        proposal_id=stored.id,
+        run_id=stored.run_id,
+        action_type=ACTION_CREATE_ACCOUNT,
+        mode=MODE_EXECUTE,
+        state=STATE_IN_PROGRESS,
+    )
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert report.applied == 0
+    assert session.posts == []
+    assert session.patches == []
+    attempts = store.list_attempts(stored.id)
+    assert len(attempts) == 1
+    assert attempts[0].id == orphan.id
+    assert attempts[0].state == STATE_IN_PROGRESS
+    assert any("in_progress" in note for note in report.notes)
+    assert any("interrupted" in note for note in report.notes)
+
+
+def test_blank_phone_still_blocks_matching_non_tool_create(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    proposed = {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine St",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44880",
+        fields.PHONE: "",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    outsider = _account(
+        "OUT1",
+        **{
+            fields.NAME: "Brand New Place",
+            fields.STREET: "9 Pine St",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44880",
+            fields.PHONE: "419-555-9999",
+            fields.PARENT_ID: "PARENT",
+            fields.CREATED_BY_CANDIDATE: False,
+        },
+    )
+    session = CrmFake({"PARENT": _parent(), "OUT1": outsider})
+    stored = _approve(store, _create_proposal(proposed))
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert session.posts == []
+    assert store.created_account_id_for_proposal(stored.id) is None
+    assert "not created by this tool" in (store.list_attempts(stored.id)[-1].error_text or "")
+
+
+def test_tool_recovery_ignores_phone_difference(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    proposed = {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine St",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44880",
+        fields.PHONE: "",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    owned = _account(
+        "OWN1",
+        **{
+            fields.NAME: "Brand New Place",
+            fields.STREET: "9 Pine St",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44880",
+            fields.PHONE: "419-555-7777",
+            fields.PARENT_ID: "PARENT",
+            fields.CREATED_BY_CANDIDATE: True,
+        },
+    )
+    session = CrmFake({"PARENT": _parent(), "OWN1": owned})
+    stored = _approve(store, _create_proposal(proposed))
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.applied == 1
+    assert session.posts == []
+    assert store.successful_attempt(stored.id).created_account_id == "OWN1"
+
+
+def test_second_apply_while_claimed_issues_zero_writes(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    stored = _approve(store, _create_proposal())
+    claimed = store.claim_execute_attempt(
+        proposal_id=stored.id,
+        run_id=stored.run_id,
+        action_type=ACTION_CREATE_ACCOUNT,
+    )
+    assert claimed.status == CLAIM_CLAIMED
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert session.posts == []
+    assert session.patches == []
+    assert len([a for a in store.list_attempts(stored.id) if a.state == STATE_IN_PROGRESS]) == 1
+
+
+def test_claim_after_applied_reports_already_applied(tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    stored = _approve(store, _create_proposal())
+    store.record_attempt(
+        proposal_id=stored.id,
+        run_id=stored.run_id,
+        action_type=ACTION_CREATE_ACCOUNT,
+        mode=MODE_EXECUTE,
+        state=STATE_APPLIED,
+        created_account_id="DONE1",
+    )
+    result = store.claim_execute_attempt(
+        proposal_id=stored.id,
+        run_id=stored.run_id,
+        action_type=ACTION_CREATE_ACCOUNT,
+    )
+    assert result.status == CLAIM_ALREADY_APPLIED
+    assert len([a for a in store.list_attempts(stored.id) if a.state == STATE_IN_PROGRESS]) == 0
