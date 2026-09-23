@@ -67,6 +67,10 @@ corrections, apply only what a human approves.
   mistaken for stale CRM data.
 - Individual facility pages carry address and care-offering detail.
 - The About page references Harborview Care Group and Cedar Trail acquisitions.
+- As of Branch 2 development, `bellhavenseniorliving.com` does not resolve in DNS
+  (NXDOMAIN). Scraper behavior is covered by fixture HTML under `tests/fixtures/html/`.
+  Live `cli scrape` will fail until the assessment site is reachable; matching and
+  normalization do not depend on the live site.
 
 ## Architecture decisions
 
@@ -85,6 +89,26 @@ corrections, apply only what a human approves.
 Four branches, each reviewed and merged before the next starts:
 `feat/schema-discovery`, `feat/scrape-and-match`, `feat/proposals-and-review`,
 `feat/apply-and-schedule`.
+
+## Current status (2026-09-22)
+
+- Branch 1 `feat/schema-discovery` is merged to `main`.
+- Branch 2 `feat/scrape-and-match` is open as [PR #2](https://github.com/royho1/bellhaven-sync/pull/2).
+  **Do not merge until Codex is clean on the latest commit (no P1/P2).**
+- Latest Branch 2 fixes:
+  1. Unit designators require a whole-word match and a real separator before the
+     unit id, so street names like Stevens/Steele are not stripped as "Ste".
+  2. Match edge costs are lexicographic tuples `(tier, similarity_penalty,
+     facility_idx, account_rank)` so deterministic index tie-breaks can never
+     outweigh a better name similarity (or tier).
+  3. Prior: max-cardinality min-cost global assignment with intrinsic ambiguity
+     preserved; listing HTML reused during enrichment; house-number-required
+     usable location; punctuated unit stripping; urls-only never complete.
+- Test suite on this branch: **90 passed**, fixture-based, no network required for
+  scraper/matcher tests.
+- Live site `bellhavenseniorliving.com` still NXDOMAIN; do not treat a failed live
+  scrape as a product bug.
+- Next after a clean merge of PR #2: `feat/proposals-and-review`.
 
 ## Open questions
 

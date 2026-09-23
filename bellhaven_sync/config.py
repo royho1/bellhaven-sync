@@ -30,6 +30,25 @@ class ConfigError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class LocalPaths:
+    """Local filesystem layout for public-site work that never touches the CRM."""
+
+    data_dir: Path
+
+    @property
+    def snapshot_dir(self) -> Path:
+        return self.data_dir / "snapshots"
+
+    @property
+    def scrape_dir(self) -> Path:
+        return self.data_dir / "scrapes"
+
+    @property
+    def html_cache_dir(self) -> Path:
+        return self.data_dir / "html"
+
+
+@dataclass(frozen=True)
 class Settings:
     api_token: str
     base_url: str
@@ -46,6 +65,10 @@ class Settings:
     @property
     def snapshot_dir(self) -> Path:
         return self.data_dir / "snapshots"
+
+    @property
+    def local_paths(self) -> LocalPaths:
+        return LocalPaths(data_dir=self.data_dir)
 
 
 _secrets: set[str] = set()
@@ -73,13 +96,27 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _load_dotenv(env_file: Path | None) -> None:
+    load_dotenv(dotenv_path=env_file or (REPO_ROOT / ".env"), override=False)
+
+
+def _data_dir_from_env() -> Path:
+    return Path(os.environ.get("BELLHAVEN_DATA_DIR") or (REPO_ROOT / "data"))
+
+
+def load_local_paths(*, env_file: Path | None = None) -> LocalPaths:
+    """Load local path settings for public-site work. No CRM token required."""
+    _load_dotenv(env_file)
+    return LocalPaths(data_dir=_data_dir_from_env())
+
+
 def load_settings(*, env_file: Path | None = None, force: bool = False) -> Settings:
-    """Load settings from the environment, falling back to a local .env file."""
+    """Load CRM-facing settings. Requires CLIPBOARD_API_TOKEN."""
     global _settings
     if _settings is not None and not force:
         return _settings
 
-    load_dotenv(dotenv_path=env_file or (REPO_ROOT / ".env"), override=False)
+    _load_dotenv(env_file)
 
     token = (os.environ.get("CLIPBOARD_API_TOKEN") or "").strip()
     if not token:
@@ -90,14 +127,13 @@ def load_settings(*, env_file: Path | None = None, force: bool = False) -> Setti
 
     base_url = (os.environ.get("CLIPBOARD_API_BASE_URL") or DEFAULT_BASE_URL).strip().rstrip("/")
     parent_id = (os.environ.get("BELLHAVEN_PARENT_ACCOUNT_ID") or "").strip() or None
-    data_dir = Path(os.environ.get("BELLHAVEN_DATA_DIR") or (REPO_ROOT / "data"))
 
     _settings = Settings(
         api_token=token,
         base_url=base_url,
         dry_run=_env_flag("DRY_RUN", True),
         bellhaven_parent_account_id=parent_id,
-        data_dir=data_dir,
+        data_dir=_data_dir_from_env(),
     )
     return _settings
 

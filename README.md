@@ -9,9 +9,9 @@ read-only by construction: it cannot reach a write method.
 
 ## Status
 
-Phase 0 (`feat/schema-discovery`) is in place: configuration, a GET-only CRM client,
-and a read-only schema probe. The scraper, matcher, proposal store, review app, and
-the apply path land in later branches.
+Phase 0 (`feat/schema-discovery`) is merged. Branch 2 adds the scraper, name/address
+normalization, the state-gated tiered matcher, duplicate detection, and the Bellhaven
+parent resolver. Proposal storage and the review app land next.
 
 ## Setup
 
@@ -31,6 +31,10 @@ that could carry it passes through `redact()` first.
 # Read-only: confirm the token, page through every account, print the observed
 # schema, and save a local snapshot under data/snapshots/.
 .venv/bin/python -m bellhaven_sync.cli discover
+
+# Read-only: scrape Bellhaven's public site (listing + sitemap + facility pages).
+# Raises a completeness blocker when the union is short of the homepage claim.
+.venv/bin/python -m bellhaven_sync.cli scrape
 ```
 
 ## Tests
