@@ -16,7 +16,7 @@ from typing import Any
 
 import requests
 
-from . import crm_client, fields
+from . import chow, crm_client, fields
 from .config import DEFAULT_TIMEOUT, Settings, redact
 from .normalize import (
     normalize_city,
@@ -83,6 +83,9 @@ CREATE_FIELDS_ALLOW = UPDATE_FIELDS_ALLOW | {fields.PARENT_ID, fields.STATUS}
 CREATE_STATUS_ALLOW = frozenset({fields.STATUS_ACTIVE, fields.STATUS_INACTIVE})
 SUPPORTED_CARE = frozenset(SUPPORTED_CARE_TYPES)
 CREATE_IDENTITY_FIELDS = (fields.NAME, fields.STREET, fields.CITY, fields.STATE, fields.ZIP)
+# Lock key uses only consistently available facility core fields so optional city/ZIP
+# coverage cannot split one facility into separate reservation namespaces.
+CREATE_LOCK_IDENTITY_FIELDS = (fields.NAME, fields.STREET, fields.STATE)
 IN_PROGRESS_CLAIM_MESSAGE = (
     "A previous execute attempt is still in_progress. It may have been interrupted "
     "after a CRM write. Refusing another execution until the prior attempt is reconciled."
@@ -421,13 +424,7 @@ def _execute(
         _patch_existing(proposal, session, settings, dict(proposal.proposed_values))
         return None
     if proposal.action_type == ACTION_REPARENT:
-        _require_account(str(proposal.proposed_values[fields.PARENT_ID]), session, settings)
-        _patch_existing(
-            proposal,
-            session,
-            settings,
-            {fields.PARENT_ID: proposal.proposed_values[fields.PARENT_ID]},
-        )
+        _apply_reparent(proposal, session, settings)
         return None
     if proposal.action_type == ACTION_CREATE_ACCOUNT:
         return _create_account(
@@ -451,6 +448,20 @@ def _patch_existing(
     live = _require_account(str(proposal.account_id), session, settings)
     _require_fresh(proposal.current_values, live)
     _patch(session, settings, str(proposal.account_id), body)
+
+
+def _apply_reparent(proposal: StoredProposal, session: Any, settings: Settings) -> None:
+    target_parent = str(proposal.proposed_values[fields.PARENT_ID])
+    _require_account(target_parent, session, settings)
+    live = _require_account(str(proposal.account_id), session, settings)
+    _require_fresh(proposal.current_values, live)
+    decision = chow.decide_parent_change(live, target_parent_id=target_parent)
+    if decision.kind != chow.KIND_REPARENT:
+        raise ApplyError(
+            "Live account financials no longer allow a direct reparent "
+            f"(decision is now {decision.kind!r}). No PATCH. Run sync and review again."
+        )
+    _patch(session, settings, str(proposal.account_id), {fields.PARENT_ID: target_parent})
 
 
 def _create_account(
@@ -505,6 +516,14 @@ def _apply_chow(
     linked = str(live.get(fields.CHOW_CURRENT_ACCOUNT) or "")
 
     if remembered and linked == remembered:
+        _require_chow_successor_matches(
+            remembered,
+            proposal,
+            session,
+            settings,
+            parent_id=parent_id,
+            template=template,
+        )
         # Link already complete; clear any identity lock retained by an earlier
         # uncertain attempt for this proposal so cleanup is not stuck on the old attempt id.
         store.release_create_identity_for_proposal(proposal.id)
@@ -520,7 +539,14 @@ def _apply_chow(
 
     _require_fresh(proposal.current_values, live)
     if remembered:
-        _require_account(remembered, session, settings)
+        _require_chow_successor_matches(
+            remembered,
+            proposal,
+            session,
+            settings,
+            parent_id=parent_id,
+            template=template,
+        )
         new_id = remembered
     else:
         _require_account(parent_id, session, settings)
@@ -557,6 +583,37 @@ def _apply_chow(
 
     _patch(session, settings, old_id, {fields.CHOW_CURRENT_ACCOUNT: new_id})
     return new_id
+
+
+def _chow_expected_create_body(parent_id: str, template: dict[str, Any]) -> dict[str, Any]:
+    body = {key: template[key] for key in CREATE_FIELDS_ALLOW if key in template}
+    body[fields.PARENT_ID] = parent_id
+    body[fields.CREATED_BY_CANDIDATE] = True
+    return body
+
+
+def _require_chow_successor_matches(
+    successor_id: str,
+    proposal: StoredProposal,
+    session: Any,
+    settings: Settings,
+    *,
+    parent_id: str,
+    template: dict[str, Any],
+) -> dict[str, Any]:
+    successor = _require_account(successor_id, session, settings)
+    expected = _chow_expected_create_body(parent_id, template)
+    if str(successor.get(fields.PARENT_ID) or "") != parent_id:
+        raise ApplyError(
+            "Remembered CHOW successor is no longer under the approved parent. "
+            "Refusing to link the old account; run sync and review again."
+        )
+    if not _same_identity(successor, expected):
+        raise ApplyError(
+            "Remembered CHOW successor no longer matches the approved create identity. "
+            "Refusing to link the old account; run sync and review again."
+        )
+    return successor
 
 
 @dataclass(frozen=True)
@@ -614,7 +671,7 @@ def _resolve_create_id(
             )
         return account_id
     if store.has_uncertain_attempt(proposal.id):
-        raise ApplyError(uncertain_message)
+        raise ApplyError(uncertain_message, uncertain=True)
     return None
 
 
@@ -648,16 +705,26 @@ def _canonical_identity_value(key: str, value: Any) -> str | None:
 
 
 def _create_identity_key(body: dict[str, Any]) -> str:
-    """Normalized create identity for cross-proposal execute serialization."""
+    """Canonical core create identity for cross-proposal execute serialization.
+
+    Uses parent + normalized name/street/state only. Optional city/ZIP are omitted
+    so differing optional-field coverage cannot create separate lock namespaces.
+    """
     parent = str(body.get(fields.PARENT_ID) or "").strip()
     parts = [f"parent={parent}"]
-    for key in CREATE_IDENTITY_FIELDS:
-        if key not in body:
-            continue
+    for key in CREATE_LOCK_IDENTITY_FIELDS:
         value = _canonical_identity_value(key, body.get(key))
         if value is None:
-            continue
+            raise ApplyError(
+                "Cannot form a safe create identity lock from the approved create body "
+                f"(missing usable {key}). Refusing create."
+            )
         parts.append(f"{key}={value}")
+    if not parent:
+        raise ApplyError(
+            "Cannot form a safe create identity lock from the approved create body "
+            "(missing parent_id). Refusing create."
+        )
     return "\n".join(parts)
 
 

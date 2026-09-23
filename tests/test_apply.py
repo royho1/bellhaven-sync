@@ -564,7 +564,7 @@ def test_chow_posts_then_patches_only_the_link(settings, tmp_path):
 def test_chow_resume_does_not_post_twice_and_conflict_blocks(settings, tmp_path):
     store = ProposalStore(tmp_path / "db.sqlite")
     old = _account("OLD1", **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300})
-    session = CrmFake({"OLD1": old, "PARENT": _parent()})
+    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _wrong_parent()})
     session.patch_failures = 1
     proposal = Proposal(
         action_type=ACTION_CHOW,
@@ -577,7 +577,11 @@ def test_chow_resume_does_not_post_twice_and_conflict_blocks(settings, tmp_path)
         },
         proposed_values={
             "new_account_parent_id": "PARENT",
-            "new_account_template": {fields.NAME: "Bellhaven of Tiffin", fields.STREET: "100 Main Street"},
+            "new_account_template": {
+                fields.NAME: "Bellhaven of Tiffin",
+                fields.STREET: "100 Main Street",
+                fields.STATE: "OH",
+            },
             "old_account_patch": {fields.CHOW_CURRENT_ACCOUNT: "<new_account_id>"},
         },
         evidence={},
@@ -687,6 +691,8 @@ def test_post_is_not_retried_and_error_is_redacted(settings, tmp_path):
             current_values={},
             proposed_values={
                 fields.NAME: "Brand New Place",
+                fields.STREET: "9 Pine St",
+                fields.STATE: "OH",
                 fields.PARENT_ID: "PARENT",
                 fields.STATUS: "Active",
             },
@@ -782,13 +788,14 @@ def test_chow_uncertain_with_no_visible_account_refuses_second_post(settings, tm
     assert store.created_account_id_for_proposal(stored.id) is None
 
     second = _run(settings, store, session, stored, execute=True, dry_run=False)
-    assert second.blocked == 1
+    assert second.failed == 1
     assert len(session.posts) == 1
     assert session.patches == []
     assert store.successful_attempt(stored.id) is None
     error = store.list_attempts(stored.id)[-1].error_text or ""
     assert "Refusing a second POST" in error
-    assert store.list_attempts(stored.id)[-1].state == STATE_BLOCKED
+    assert store.list_attempts(stored.id)[-1].state == STATE_UNCERTAIN
+    assert store.has_create_identity_lock_for_proposal(stored.id)
 
 
 def test_chow_multiple_recovery_matches_blocks_without_write(settings, tmp_path):
@@ -918,12 +925,13 @@ def test_create_uncertain_with_no_visible_account_refuses_second_post(settings, 
     assert store.created_account_id_for_proposal(stored.id) is None
 
     second = _run(settings, store, session, stored, execute=True, dry_run=False)
-    assert second.blocked == 1
+    assert second.failed == 1
     assert len(session.posts) == 1
     assert store.successful_attempt(stored.id) is None
     error = store.list_attempts(stored.id)[-1].error_text or ""
     assert "Refusing a second POST" in error
-    assert store.list_attempts(stored.id)[-1].state == STATE_BLOCKED
+    assert store.list_attempts(stored.id)[-1].state == STATE_UNCERTAIN
+    assert store.has_create_identity_lock_for_proposal(stored.id)
 
 
 def test_create_recovers_lost_post_response_without_second_post(settings, tmp_path):
@@ -1371,6 +1379,32 @@ def test_uncertain_create_keeps_identity_lock_against_other_proposal(settings, t
     assert len(session.posts) == 1
     error = store.list_attempts(second.id)[-1].error_text or ""
     assert "already creating an account with this identity" in error
+    assert store.has_create_identity_lock_for_proposal(first.id)
+
+    # Original proposal retries with nothing visible: stays uncertain and keeps the lock.
+    retry = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=first.run_id,
+        proposal_id=first.id,
+        execute=True,
+    )
+    assert retry.failed == 1
+    assert len(session.posts) == 1
+    assert store.list_attempts(first.id)[-1].state == STATE_UNCERTAIN
+    assert store.has_create_identity_lock_for_proposal(first.id)
+
+    still_blocked = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=second.run_id,
+        proposal_id=second.id,
+        execute=True,
+    )
+    assert still_blocked.blocked == 1
+    assert len(session.posts) == 1
 
 
 def test_original_proposal_recovers_after_uncertain_create(settings, tmp_path):
@@ -1529,3 +1563,186 @@ def test_chow_uncertain_patch_release_identity_lock_after_reconcile(settings, tm
     assert len(session.posts) == 1
     assert store.successful_attempt(stored.id).created_account_id == new_id
     assert not store.has_create_identity_lock_for_proposal(stored.id)
+
+
+def test_reparent_blocked_when_live_financials_require_chow(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake(
+        {
+            "C1": _account("C1", **{fields.PARENT_ID: "OLD", fields.LIFETIME_REVENUE: 0, fields.OUTSTANDING_AR: 0}),
+            "PARENT": _parent(),
+            "OLD": _account("OLD"),
+        }
+    )
+    stored = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_REPARENT,
+            account_id="C1",
+            facility_url="https://example.test/a",
+            current_values={fields.PARENT_ID: "OLD"},
+            proposed_values={fields.PARENT_ID: "PARENT"},
+            evidence={},
+            confidence="high",
+        ),
+    )
+    session.accounts["C1"][fields.LIFETIME_REVENUE] = 9000
+    session.accounts["C1"][fields.OUTSTANDING_AR] = 300
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert session.patches == []
+    assert "no longer allow a direct reparent" in (store.list_attempts(stored.id)[-1].error_text or "")
+
+
+def test_reparent_blocked_when_live_financials_are_ambiguous(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake(
+        {
+            "C1": _account("C1", **{fields.PARENT_ID: "OLD", fields.LIFETIME_REVENUE: 0, fields.OUTSTANDING_AR: 0}),
+            "PARENT": _parent(),
+            "OLD": _account("OLD"),
+        }
+    )
+    stored = _approve(
+        store,
+        Proposal(
+            action_type=ACTION_REPARENT,
+            account_id="C1",
+            facility_url="https://example.test/a",
+            current_values={
+                fields.PARENT_ID: "OLD",
+                fields.LIFETIME_REVENUE: 0,
+                fields.OUTSTANDING_AR: 0,
+            },
+            proposed_values={fields.PARENT_ID: "PARENT"},
+            evidence={},
+            confidence="high",
+        ),
+    )
+    session.accounts["C1"][fields.OUTSTANDING_AR] = 50
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.blocked == 1
+    assert session.patches == []
+
+
+def test_optional_city_zip_coverage_shares_create_identity_lock(settings, tmp_path):
+    from bellhaven_sync import apply as apply_mod
+
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    with_zip = {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine Street",
+        fields.CITY: "Tiffin",
+        fields.STATE: "OH",
+        fields.ZIP: "44880",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    without_optional = {
+        fields.NAME: "Brand New Place",
+        fields.STREET: "9 Pine St.",
+        fields.STATE: "oh",
+        fields.PARENT_ID: "PARENT",
+        fields.STATUS: "Active",
+    }
+    assert apply_mod._create_identity_key({**with_zip, fields.CREATED_BY_CANDIDATE: True}) == (
+        apply_mod._create_identity_key({**without_optional, fields.CREATED_BY_CANDIDATE: True})
+    )
+    first, second = _approve_many(
+        store,
+        _create_proposal(with_zip),
+        _create_proposal(without_optional),
+    )
+    first_claim = store.claim_execute_attempt(
+        proposal_id=first.id,
+        run_id=first.run_id,
+        action_type=ACTION_CREATE_ACCOUNT,
+    )
+    assert first_claim.status == CLAIM_CLAIMED
+    assert first_claim.attempt is not None
+    assert store.claim_create_identity(
+        identity_key=apply_mod._create_identity_key({**with_zip, fields.CREATED_BY_CANDIDATE: True}),
+        proposal_id=first.id,
+        attempt_id=first_claim.attempt.id,
+    )
+    report = run_apply(
+        settings=replace(settings, dry_run=False),
+        store=store,
+        session=session,
+        run_id=second.run_id,
+        proposal_id=second.id,
+        execute=True,
+    )
+    assert report.blocked == 1
+    assert session.posts == []
+
+
+def test_remembered_chow_successor_reparented_blocks_without_second_post(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    old = _account(
+        "OLD1",
+        **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300},
+    )
+    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _wrong_parent()})
+    session.patch_failures = 1
+    stored = _approve(store, _chow_proposal())
+    first = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert first.failed == 1
+    new_id = store.created_account_id_for_proposal(stored.id)
+    assert new_id
+    assert len(session.posts) == 1
+    session.accounts[new_id][fields.PARENT_ID] = "OTHER"
+    session.accounts["OTHER"] = _account("OTHER")
+
+    second = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert second.blocked == 1
+    assert len(session.posts) == 1
+    assert session.accounts["OLD1"][fields.CHOW_CURRENT_ACCOUNT] == ""
+    assert "no longer under the approved parent" in (store.list_attempts(stored.id)[-1].error_text or "")
+
+
+def test_remembered_chow_successor_identity_changed_blocks_without_second_post(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    old = _account(
+        "OLD1",
+        **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300},
+    )
+    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _wrong_parent()})
+    session.patch_failures = 1
+    stored = _approve(store, _chow_proposal())
+    first = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert first.failed == 1
+    new_id = store.created_account_id_for_proposal(stored.id)
+    assert new_id
+    session.accounts[new_id][fields.NAME] = "Completely Different Place"
+    session.accounts[new_id][fields.STREET] = "999 Other Rd"
+
+    second = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert second.blocked == 1
+    assert len(session.posts) == 1
+    assert "no longer matches the approved create identity" in (
+        store.list_attempts(stored.id)[-1].error_text or ""
+    )
+
+
+def test_remembered_chow_successor_still_valid_links_without_second_post(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    old = _account(
+        "OLD1",
+        **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300},
+    )
+    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _wrong_parent()})
+    session.patch_failures = 1
+    stored = _approve(store, _chow_proposal())
+    first = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert first.failed == 1
+    new_id = store.created_account_id_for_proposal(stored.id)
+    assert new_id
+    assert len(session.posts) == 1
+
+    second = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert second.applied == 1
+    assert len(session.posts) == 1
+    assert session.patches[-1] == ("OLD1", {fields.CHOW_CURRENT_ACCOUNT: new_id})
+    assert session.accounts["OLD1"][fields.CHOW_CURRENT_ACCOUNT] == new_id

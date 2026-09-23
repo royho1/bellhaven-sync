@@ -193,7 +193,15 @@ Four branches, each reviewed and merged before the next starts:
      `normalize_street` / `normalize_city` / `normalize_state` / `normalize_zip`.
   23. `claim_execute_attempt` re-reads proposal status under `BEGIN IMMEDIATE`
      and refuses with `CLAIM_NOT_APPROVED` if the proposal is no longer approved.
-- Test suite on this branch: **172 passed**, fixture-based, no live POST/PATCH.
+  24. ACTION_REPARENT re-runs `chow.decide_parent_change` on the live account
+     before PATCH; only `KIND_REPARENT` may proceed. New reparent proposals store
+     `lifetime_revenue` and `outstanding_ar` in `current_values`.
+  25. Uncertain create/CHOW recovery that still finds no account stays
+     `uncertain` (not blocked) so the identity lock is retained.
+  26. Create identity locks use parent + normalized name/street/state only.
+  27. Remembered CHOW successors are revalidated (parent + canonical identity)
+     before linking the old account.
+- Test suite on this branch: **179 passed**, fixture-based, no live POST/PATCH.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
 - Real-world limit: execute mode is implemented and tested with fake sessions
   only. It has not been run against the assessment API.
