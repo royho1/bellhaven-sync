@@ -204,10 +204,37 @@ class ProposalStore:
             row = conn.execute("SELECT id FROM reconciliation_runs ORDER BY id DESC LIMIT 1").fetchone()
         return int(row["id"]) if row else None
 
-    def action_types(self) -> list[str]:
+    def list_runs(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT DISTINCT action_type FROM proposals ORDER BY action_type"
+                """
+                SELECT id, started_at, finished_at, scrape_complete, parent_account_id
+                FROM reconciliation_runs
+                ORDER BY id DESC
+                """
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "started_at": row["started_at"],
+                "finished_at": row["finished_at"],
+                "scrape_complete": bool(row["scrape_complete"]),
+                "parent_account_id": row["parent_account_id"],
+            }
+            for row in rows
+        ]
+
+    def action_types(self, *, run_id: int | None = None) -> list[str]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT DISTINCT action_type FROM proposals {where} ORDER BY action_type",
+                params,
             ).fetchall()
         return [str(row["action_type"]) for row in rows]
 

@@ -215,6 +215,80 @@ def test_chow_two_step_proposal():
     assert fields.PARENT_ID in chows[0].proposed_values["old_account_unchanged"]
 
 
+def test_chow_two_step_suppresses_old_account_field_updates():
+    """Website diffs must live in the new-account template, not update the old account."""
+    facility = _facility(
+        name="Bellhaven of Tiffin Updated",
+        phone="419-555-9999",
+        care_types=["Memory Care"],
+    )
+    account = _account(
+        **{
+            fields.PARENT_ID: "WRONG",
+            fields.LIFETIME_REVENUE: 9000,
+            fields.OUTSTANDING_AR: 300,
+            fields.NAME: "Bellhaven of Tiffin",
+            fields.PHONE: "419-555-0100",
+            fields.CARE_TYPE: "Assisted Living",
+        }
+    )
+    matches = match_facilities([facility], [account])
+    assert matches[0].account is not None
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=matches,
+        parent=_parent(),
+        duplicates=[],
+    )
+    chows = [p for p in batch.proposals if p.action_type == ACTION_CHOW]
+    updates = [p for p in batch.proposals if p.action_type == ACTION_UPDATE_FIELDS]
+    assert len(chows) == 1
+    assert updates == []
+    template = chows[0].proposed_values["new_account_template"]
+    assert template[fields.NAME] == "Bellhaven of Tiffin Updated"
+    assert template[fields.PHONE] == "419-555-9999"
+    assert template[fields.CARE_TYPE] == "Memory Care"
+    assert template[fields.STREET] == facility.street
+    assert chows[0].proposed_values["old_account_patch"] == {
+        fields.CHOW_CURRENT_ACCOUNT: "<new_account_id>"
+    }
+    for protected in (
+        fields.PARENT_ID,
+        fields.STATUS,
+        fields.NOTE,
+        fields.NAME,
+        fields.STREET,
+        fields.CITY,
+        fields.STATE,
+        fields.ZIP,
+    ):
+        assert protected in chows[0].proposed_values["old_account_unchanged"]
+
+
+def test_reparent_still_allows_field_updates():
+    facility = _facility(phone="419-555-9999")
+    account = _account(
+        **{
+            fields.PARENT_ID: "WRONG",
+            fields.LIFETIME_REVENUE: 100,
+            fields.OUTSTANDING_AR: 0,
+            fields.PHONE: "419-555-0100",
+        }
+    )
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=match_facilities([facility], [account]),
+        parent=_parent(),
+        duplicates=[],
+    )
+    assert any(p.action_type == ACTION_REPARENT for p in batch.proposals)
+    updates = [p for p in batch.proposals if p.action_type == ACTION_UPDATE_FIELDS]
+    assert len(updates) == 1
+    assert updates[0].proposed_values[fields.PHONE] == "419-555-9999"
+
+
 def test_ambiguous_chow_routes_to_review():
     facility = _facility()
     account = _account(**{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 0, fields.OUTSTANDING_AR: 50})
@@ -253,3 +327,36 @@ def test_stale_child_when_scrape_complete():
     stales = [p for p in batch.proposals if p.action_type == ACTION_REVIEW_STALE]
     assert len(stales) == 1
     assert stales[0].account_id == "STALE"
+
+
+def test_ambiguous_candidates_are_not_marked_stale():
+    facility = _facility()
+    a1 = _account(**{fields.ACCOUNT_ID: "A1", fields.NAME: "Bellhaven of Tiffin East"})
+    a2 = _account(**{fields.ACCOUNT_ID: "A2", fields.NAME: "Bellhaven of Tiffin West"})
+    parent_acct = _account(**{fields.ACCOUNT_ID: "PARENT", fields.PARENT_ID: ""})
+    matches = match_facilities([facility], [a1, a2])
+    assert matches[0].ambiguous
+    batch = generate_proposals(
+        scrape=_scrape([facility], complete=True),
+        accounts=[parent_acct, a1, a2],
+        matches=matches,
+        parent=_parent(),
+        duplicates=[],
+    )
+    ambiguous = [p for p in batch.proposals if p.action_type == ACTION_REVIEW_AMBIGUOUS]
+    assert len(ambiguous) == 1
+    stale_ids = {
+        p.account_id for p in batch.proposals if p.action_type == ACTION_REVIEW_STALE
+    }
+    assert "A1" not in stale_ids
+    assert "A2" not in stale_ids
+    assert all(
+        p.action_type
+        not in {ACTION_UPDATE_FIELDS, ACTION_REPARENT, ACTION_CHOW, ACTION_CREATE_ACCOUNT}
+        or p.account_id not in {"A1", "A2"}
+        for p in batch.proposals
+    )
+    assert all(
+        p.action_type != ACTION_UPDATE_FIELDS and p.action_type != ACTION_REPARENT
+        for p in batch.proposals
+    )

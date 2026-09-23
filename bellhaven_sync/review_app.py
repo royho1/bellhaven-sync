@@ -1,6 +1,7 @@
 """Minimal local Flask UI for reviewing reconciliation proposals.
 
 Approve/reject only updates SQLite. This app never calls the CRM.
+The default view shows only the latest reconciliation run.
 """
 
 from __future__ import annotations
@@ -44,6 +45,15 @@ PAGE = """
     }
     h1 { margin: 0 0 0.35rem; font-size: 1.45rem; }
     .sub { color: var(--muted); margin: 0; }
+    .run-banner {
+      margin-top: 0.75rem;
+      padding: 0.55rem 0.75rem;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--ink);
+      font-size: 0.95rem;
+    }
     main { padding: 1.25rem 1.75rem 2.5rem; max-width: 1100px; }
     form.filters {
       display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: end;
@@ -82,9 +92,25 @@ PAGE = """
   <header>
     <h1>Bellhaven Sync Review</h1>
     <p class="sub">Local SQLite decisions only. This UI never writes to the CRM.</p>
+    {% if selected_run_id %}
+    <p class="run-banner">
+      Viewing reconciliation run <strong>#{{ selected_run_id }}</strong>
+      {% if selected_run_id == latest_run_id %}(latest){% else %}(historical){% endif %}
+      {% if selected_run_started %} · started {{ selected_run_started }}{% endif %}
+    </p>
+    {% endif %}
   </header>
   <main>
     <form class="filters" method="get">
+      <label>Run
+        <select name="run_id">
+          {% for run in runs %}
+          <option value="{{ run.id }}" {% if run.id == selected_run_id %}selected{% endif %}>
+            #{{ run.id }}{% if run.id == latest_run_id %} (latest){% endif %} · {{ run.started_at }}
+          </option>
+          {% endfor %}
+        </select>
+      </label>
       <label>Status
         <select name="status">
           <option value="">all</option>
@@ -104,8 +130,10 @@ PAGE = """
       <button class="primary" type="submit">Filter</button>
     </form>
 
-    {% if not items %}
-      <p class="empty">No proposals match these filters. Run <code>python -m bellhaven_sync.cli sync</code> first.</p>
+    {% if not selected_run_id %}
+      <p class="empty">No reconciliation runs yet. Run <code>python -m bellhaven_sync.cli sync</code> first.</p>
+    {% elif not items %}
+      <p class="empty">No proposals match these filters for run #{{ selected_run_id }}.</p>
     {% endif %}
 
     {% for item in items %}
@@ -134,12 +162,14 @@ PAGE = """
           <input type="hidden" name="status" value="approved">
           <input type="hidden" name="return_status" value="{{ status }}">
           <input type="hidden" name="return_action_type" value="{{ action_type }}">
+          <input type="hidden" name="return_run_id" value="{{ selected_run_id }}">
           <button class="ok" type="submit">Approve</button>
         </form>
         <form method="post" action="{{ url_for('set_status', proposal_id=item.id) }}">
           <input type="hidden" name="status" value="rejected">
           <input type="hidden" name="return_status" value="{{ status }}">
           <input type="hidden" name="return_action_type" value="{{ action_type }}">
+          <input type="hidden" name="return_run_id" value="{{ selected_run_id }}">
           <button class="bad" type="submit">Reject</button>
         </form>
       </div>
@@ -172,6 +202,20 @@ def _view_item(item: StoredProposal) -> dict:
     }
 
 
+def _resolve_run_id(store: ProposalStore, raw: str | None) -> int | None:
+    latest = store.latest_run_id()
+    if latest is None:
+        return None
+    if not raw:
+        return latest
+    try:
+        requested = int(raw)
+    except (TypeError, ValueError):
+        return latest
+    known = {run["id"] for run in store.list_runs()}
+    return requested if requested in known else latest
+
+
 def create_app(db_path: Path | str) -> Flask:
     store = ProposalStore(db_path)
     app = Flask(__name__)
@@ -183,14 +227,31 @@ def create_app(db_path: Path | str) -> Flask:
         action_type = (request.args.get("action_type") or "").strip() or None
         if status and status not in STATUS_VALUES:
             status = None
-        items = [_view_item(p) for p in store.list_proposals(status=status, action_type=action_type)]
+        runs = store.list_runs()
+        latest_run_id = store.latest_run_id()
+        selected_run_id = _resolve_run_id(store, request.args.get("run_id"))
+        selected_run = next((run for run in runs if run["id"] == selected_run_id), None)
+        items = []
+        if selected_run_id is not None:
+            items = [
+                _view_item(p)
+                for p in store.list_proposals(
+                    status=status,
+                    action_type=action_type,
+                    run_id=selected_run_id,
+                )
+            ]
         return render_template_string(
             PAGE,
             items=items,
             status=status or "",
             action_type=action_type or "",
             statuses=sorted(STATUS_VALUES),
-            action_types=store.action_types(),
+            action_types=store.action_types(run_id=selected_run_id),
+            runs=runs,
+            selected_run_id=selected_run_id,
+            latest_run_id=latest_run_id,
+            selected_run_started=(selected_run or {}).get("started_at"),
         )
 
     @app.post("/proposals/<int:proposal_id>/status")
@@ -204,6 +265,7 @@ def create_app(db_path: Path | str) -> Flask:
                 "index",
                 status=request.form.get("return_status") or None,
                 action_type=request.form.get("return_action_type") or None,
+                run_id=request.form.get("return_run_id") or None,
             )
         )
 

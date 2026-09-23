@@ -178,6 +178,8 @@ def generate_proposals(
 
     matched_account_ids: set[str] = set()
     matched_facility_urls: set[str] = set()
+    # Ambiguous candidates are website-associated for stale detection only.
+    website_associated_ids: set[str] = set()
 
     for result in matches:
         facility = result.facility
@@ -202,6 +204,9 @@ def generate_proposals(
                 )
             )
             matched_facility_urls.add(facility.url)
+            for candidate in result.runners_up:
+                if candidate.account_id:
+                    website_associated_ids.add(str(candidate.account_id))
             continue
 
         if result.account is None:
@@ -213,6 +218,8 @@ def generate_proposals(
         matched_facility_urls.add(facility.url)
 
         # Parent / CHOW decisions only when we know the correct Bellhaven parent.
+        # Two-step CHOW forbids any other old-account field writes.
+        suppress_old_account_field_updates = False
         current_parent = str(account.get(fields.PARENT_ID) or "")
         if parent_ok and parent.account_id and current_parent != parent.account_id:
             decision = chow.decide_parent_change(account, target_parent_id=parent.account_id)
@@ -239,6 +246,7 @@ def generate_proposals(
                     )
                 )
             elif decision.kind == chow.KIND_CHOW_TWO_STEP:
+                suppress_old_account_field_updates = True
                 batch.add(
                     Proposal(
                         action_type=ACTION_CHOW,
@@ -300,27 +308,28 @@ def generate_proposals(
                     )
                 )
 
-        current_diff, proposed_diff = _field_diffs(facility, account)
-        if current_diff:
-            batch.add(
-                Proposal(
-                    action_type=ACTION_UPDATE_FIELDS,
-                    account_id=account_id,
-                    facility_url=facility.url,
-                    current_values=current_diff,
-                    proposed_values=proposed_diff,
-                    evidence={
-                        "match_tier": result.tier,
-                        "match_confidence": result.confidence,
-                        "match_reasons": list(result.reasons),
-                        "name_similarity": result.name_similarity,
-                        "facility_name": facility.name,
-                    },
-                    confidence=result.confidence,
-                    requires_review=True,
-                    reason="website values differ from CRM on normalized comparison",
+        if not suppress_old_account_field_updates:
+            current_diff, proposed_diff = _field_diffs(facility, account)
+            if current_diff:
+                batch.add(
+                    Proposal(
+                        action_type=ACTION_UPDATE_FIELDS,
+                        account_id=account_id,
+                        facility_url=facility.url,
+                        current_values=current_diff,
+                        proposed_values=proposed_diff,
+                        evidence={
+                            "match_tier": result.tier,
+                            "match_confidence": result.confidence,
+                            "match_reasons": list(result.reasons),
+                            "name_similarity": result.name_similarity,
+                            "facility_name": facility.name,
+                        },
+                        confidence=result.confidence,
+                        requires_review=True,
+                        reason="website values differ from CRM on normalized comparison",
+                    )
                 )
-            )
 
     # Unmatched website facilities → create only when scrape + parent are trusted.
     for result in matches:
@@ -358,6 +367,8 @@ def generate_proposals(
         for account in accounts:
             account_id = str(account.get(fields.ACCOUNT_ID) or "")
             if not account_id or account_id in matched_account_ids:
+                continue
+            if account_id in website_associated_ids:
                 continue
             if account_id == parent.account_id:
                 continue

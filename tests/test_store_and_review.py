@@ -107,11 +107,80 @@ def test_review_ui_approve_updates_sqlite_only(tmp_path):
     listing = client.get("/")
     assert listing.status_code == 200
     assert b"city differs" in listing.data
+    assert b"Viewing reconciliation run" in listing.data
 
     response = client.post(
         f"/proposals/{proposal.id}/status",
-        data={"status": "approved"},
+        data={"status": "approved", "return_run_id": str(proposal.run_id)},
         follow_redirects=True,
     )
     assert response.status_code == 200
     assert store.get_proposal(proposal.id).status == STATUS_APPROVED
+
+
+def test_review_ui_defaults_to_latest_run_only(tmp_path):
+    db = tmp_path / "runs.sqlite"
+    store = ProposalStore(db)
+    run1 = store.save_run(
+        _batch(
+            Proposal(
+                action_type=ACTION_UPDATE_FIELDS,
+                account_id="OLD",
+                facility_url="https://example.test/old",
+                current_values={"city": "OldCity"},
+                proposed_values={"city": "OldProposed"},
+                evidence={"reason": "old-run-pending"},
+                confidence="high",
+            )
+        )
+    )
+    run2 = store.save_run(
+        _batch(
+            Proposal(
+                action_type=ACTION_UPDATE_FIELDS,
+                account_id="NEW",
+                facility_url="https://example.test/new",
+                current_values={"city": "NewCity"},
+                proposed_values={"city": "NewProposed"},
+                evidence={"reason": "new-run-pending"},
+                confidence="high",
+            )
+        )
+    )
+    assert store.latest_run_id() == run2
+
+    app = create_app(db)
+    client = app.test_client()
+
+    default = client.get("/")
+    assert default.status_code == 200
+    assert b"new-run-pending" in default.data
+    assert b"old-run-pending" not in default.data
+    assert f"#{run2}".encode() in default.data or b"(latest)" in default.data
+
+    filtered = client.get("/?status=pending")
+    assert b"new-run-pending" in filtered.data
+    assert b"old-run-pending" not in filtered.data
+
+    historical = client.get(f"/?run_id={run1}")
+    assert historical.status_code == 200
+    assert b"old-run-pending" in historical.data
+    assert b"new-run-pending" not in historical.data
+    assert b"(historical)" in historical.data
+
+    old_proposal = store.list_proposals(run_id=run1)[0]
+    approved = client.post(
+        f"/proposals/{old_proposal.id}/status",
+        data={
+            "status": "approved",
+            "return_run_id": str(run1),
+            "return_status": "",
+        },
+        follow_redirects=True,
+    )
+    assert approved.status_code == 200
+    assert store.get_proposal(old_proposal.id).status == STATUS_APPROVED
+    assert b"Viewing reconciliation run" in approved.data
+    assert b"#1" in approved.data or b"run #1" in approved.data.lower() or b"(historical)" in approved.data
+    assert b"new-run-pending" not in approved.data
+    assert b"old-run-pending" in approved.data
