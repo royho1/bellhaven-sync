@@ -93,22 +93,62 @@ Four branches, each reviewed and merged before the next starts:
 ## Current status (2026-09-22)
 
 - Branch 1 `feat/schema-discovery` is merged to `main`.
-- Branch 2 `feat/scrape-and-match` is open as [PR #2](https://github.com/royho1/bellhaven-sync/pull/2).
-  **Do not merge until Codex is clean on the latest commit (no P1/P2).**
-- Latest Branch 2 fixes:
-  1. Unit designators require a whole-word match and a real separator before the
-     unit id, so street names like Stevens/Steele are not stripped as "Ste".
-  2. Match edge costs are lexicographic tuples `(tier, similarity_penalty,
-     facility_idx, account_rank)` so deterministic index tie-breaks can never
-     outweigh a better name similarity (or tier).
-  3. Prior: max-cardinality min-cost global assignment with intrinsic ambiguity
-     preserved; listing HTML reused during enrichment; house-number-required
-     usable location; punctuated unit stripping; urls-only never complete.
-- Test suite on this branch: **90 passed**, fixture-based, no network required for
-  scraper/matcher tests.
-- Live site `bellhavenseniorliving.com` still NXDOMAIN; do not treat a failed live
-  scrape as a product bug.
-- Next after a clean merge of PR #2: `feat/proposals-and-review`.
+- Branch 2 `feat/scrape-and-match` is merged to `main` via PR #2 (`4cf89e7`).
+- Branch 3 `feat/proposals-and-review` is open as [PR #3](https://github.com/royho1/bellhaven-sync/pull/3).
+  **Do not merge until Codex is clean. Do not start Branch 4 yet.**
+- Branch 3 decisions:
+  1. Explicit proposal action types in `proposals.py` (update/reparent/CHOW/create/
+     ambiguous/duplicate/stale/chow-review/inactive-review/care-type-review).
+     No invented merge/delete/deactivate.
+  2. `chow.py` isolates parent-change policy; zero revenue + positive AR is human
+     review; revenue+AR uses two-step CHOW plan; otherwise direct re-parent.
+  3. Two-step CHOW suppresses `update_fields` on the old account; website values
+     live only in `new_account_template`, and the old account patch is solely
+     `chow_current_account`.
+  4. Unresolved CHOW (`KIND_HUMAN_REVIEW`: wrong parent, `lifetime_revenue == 0`,
+     `outstanding_ar > 0`) also suppresses `update_fields` on that old account.
+     The pipeline still emits only `review_chow_ambiguous`. No auto-reparent and
+     no auto-CHOW. Direct re-parent may still emit normal field updates.
+  5. Ambiguous facilities store the complete candidate account IDs on
+     `MatchResult.candidate_account_ids`, taken from the full candidate list
+     before display truncation. `runners_up` stays a short evidence list.
+     Stale suppression uses the complete ID set only. Those accounts are not
+     confident matches and get no update, reparent, or CHOW proposals.
+  6. Review status POSTs require a per-session CSRF token (`secrets`, Flask
+     `secret_key` generated at app creation, `secrets.compare_digest`). Missing
+     or wrong tokens return 403 and do not change SQLite.
+  7. `cli serve` / `run_server` bind loopback only (`127.0.0.1`, `localhost`,
+     `::1`). `0.0.0.0`, LAN IPs, and other hosts fail before the server starts.
+  8. SQLite `data/bellhaven_sync.db` stores runs + proposals; new runs insert rows
+     and never overwrite prior review status. Review UI defaults to the latest run.
+  9. `cli sync` and `cli serve` are CRM-read-only; approve/reject only updates SQLite.
+  10. Incomplete scrape or unresolved parent suppresses create/stale/parent-move
+     proposals that depend on that certainty. Unresolved parent also suppresses
+     `update_fields` on matched accounts: no reparent, no CHOW, and no
+     independently approvable field write until the Bellhaven parent is known.
+     A resolved correct parent still emits normal `update_fields`.
+  11. A confident match to a CRM account with `status == "Inactive"` emits
+     `review_inactive_account` only. `STATUS` stays out of `COMPARABLE_FIELDS`.
+     The proposal records the inactive status and match evidence and does not
+     set status to Active. Ordinary field diffs may still be proposed when
+     existing safety rules allow them. No automatic reactivation.
+  12. `normalize_street()` still drops suite/unit identifiers for matching.
+     Proposal field comparison uses `normalize_street_for_comparison()`, which
+     canonicalizes unit designators (`Suite`/`Ste.`/`Suite #`, `Apartment`/`Apt.`,
+     `#`/`Unit`/`Unit #`) and keeps the unit identifier, so `Suite 200` and
+     `Suite 100` differ. `Suite #200` is the same unit as `Suite 200`.
+  13. Writable `care_type` values stay inside the observed CRM set: Skilled
+     Nursing, Assisted Living, Memory Care, Independent Living. Multiple website
+     offerings, or an unrecognized offering, become `review_care_type` only.
+     They are never joined into a composite, and create/CHOW templates omit
+     `care_type` until there is exactly one supported value. No offering is
+     chosen automatically.
+  14. `normalize_name()` stays lossy for matching. Proposal name comparison uses
+     `normalize_name_for_comparison()`, which keeps qualifiers such as Memory
+     Care, Assisted Living, and parenthetical words.
+- Test suite on this branch: **137 passed**, fixture-based, no network required.
+- Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
+- Next after a clean merge of PR #3: `feat/apply-and-schedule`.
 
 ## Open questions
 

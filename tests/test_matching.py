@@ -31,6 +31,55 @@ def _facility(**kwargs):
     return Facility(**defaults)
 
 
+def test_care_qualifier_in_name_does_not_block_address_match():
+    facility = _facility(
+        name="Bellhaven Memory Care of Tiffin",
+        street="100 Main St",
+        city="Tiffin",
+        state="OH",
+        zip="44883",
+    )
+    account = _account(
+        **{
+            fields.ACCOUNT_ID: "N1",
+            fields.NAME: "Bellhaven Assisted Living of Tiffin",
+            fields.STREET: "100 Main Street",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44883",
+        }
+    )
+    results = match_facilities([facility], [account])
+    assert results[0].ambiguous is False
+    assert results[0].account is not None
+    assert results[0].account[fields.ACCOUNT_ID] == "N1"
+
+
+def test_unit_identifier_difference_does_not_break_match():
+    facility = _facility(
+        name="Bellhaven of Tiffin",
+        street="100 Main St Suite 200",
+        city="Tiffin",
+        state="OH",
+        zip="44883",
+    )
+    account = _account(
+        **{
+            fields.ACCOUNT_ID: "U1",
+            fields.NAME: "Bellhaven of Tiffin",
+            fields.STREET: "100 Main St Suite 100",
+            fields.CITY: "Tiffin",
+            fields.STATE: "OH",
+            fields.ZIP: "44883",
+        }
+    )
+    results = match_facilities([facility], [account])
+    assert results[0].ambiguous is False
+    assert results[0].account is not None
+    assert results[0].account[fields.ACCOUNT_ID] == "U1"
+    assert results[0].tier == TIER_STREET_ZIP
+
+
 def test_tier1_exact_street_and_zip():
     facility = _facility(
         name="Bellhaven Meadows of Findlay",

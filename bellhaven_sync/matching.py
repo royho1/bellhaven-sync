@@ -45,7 +45,11 @@ class MatchResult:
     name_similarity: float = 0.0
     reasons: list[str] = field(default_factory=list)
     ambiguous: bool = False
+    # Human-readable evidence only. Truncated; do not use for stale suppression.
     runners_up: list[MatchCandidate] = field(default_factory=list)
+    # Every plausible CRM account for an intrinsically ambiguous facility,
+    # captured before display truncation. Not a confident match.
+    candidate_account_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -367,6 +371,7 @@ def match_facilities(
                 reasons=list(best.reasons) + ["ambiguous: multiple candidates"],
                 ambiguous=True,
                 runners_up=[best, *runners],
+                candidate_account_ids=[c.account_id for c in candidates],
             )
             continue
         assignable.append(idx)

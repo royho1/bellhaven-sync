@@ -1,0 +1,568 @@
+"""Reconciliation proposals: conservative, explicit action types only.
+
+Proposals describe what a human might approve later. This module never writes
+to the CRM. Field comparison uses normalized values; proposed CRM values keep
+the human-readable website originals.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+from . import chow, fields
+from .matching import DuplicateGroup, MatchResult, ParentResolution
+from .normalize import normalize_name_for_comparison, normalize_street_for_comparison, normalize_zip
+from .scraper import Facility, ScrapeResult
+
+ACTION_UPDATE_FIELDS = "update_fields"
+ACTION_REPARENT = "reparent"
+ACTION_CHOW = "chow_create_and_link"
+ACTION_CREATE_ACCOUNT = "create_account"
+ACTION_REVIEW_AMBIGUOUS = "review_ambiguous"
+ACTION_REVIEW_DUPLICATE = "review_duplicate"
+ACTION_REVIEW_STALE = "review_stale_or_missing"
+ACTION_REVIEW_CHOW = "review_chow_ambiguous"
+ACTION_REVIEW_INACTIVE = "review_inactive_account"
+ACTION_REVIEW_CARE_TYPE = "review_care_type"
+
+# Observed CRM care_type domain. Unset is the empty string, not a writable value.
+SUPPORTED_CARE_TYPES = (
+    "Skilled Nursing",
+    "Assisted Living",
+    "Memory Care",
+    "Independent Living",
+)
+_SUPPORTED_CARE_BY_KEY = {name.casefold(): name for name in SUPPORTED_CARE_TYPES}
+
+STATUS_PENDING = "pending"
+STATUS_APPROVED = "approved"
+STATUS_REJECTED = "rejected"
+
+STATUS_VALUES = frozenset({STATUS_PENDING, STATUS_APPROVED, STATUS_REJECTED})
+
+COMPARABLE_FIELDS = (
+    fields.NAME,
+    fields.STREET,
+    fields.CITY,
+    fields.STATE,
+    fields.ZIP,
+    fields.CARE_TYPE,
+    fields.PHONE,
+)
+
+
+@dataclass
+class Proposal:
+    action_type: str
+    account_id: str | None
+    facility_url: str | None
+    current_values: dict[str, Any]
+    proposed_values: dict[str, Any]
+    evidence: dict[str, Any]
+    confidence: str
+    requires_review: bool = True
+    status: str = STATUS_PENDING
+    reason: str = ""
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "action_type": self.action_type,
+            "account_id": self.account_id,
+            "facility_url": self.facility_url,
+            "current_values": self.current_values,
+            "proposed_values": self.proposed_values,
+            "evidence": {
+                **self.evidence,
+                "reason": self.reason or self.evidence.get("reason", ""),
+            },
+            "confidence": self.confidence,
+            "requires_review": self.requires_review,
+            "status": self.status,
+        }
+
+
+@dataclass
+class ProposalBatch:
+    proposals: list[Proposal] = field(default_factory=list)
+    blockers: list[str] = field(default_factory=list)
+    summary: dict[str, int] = field(default_factory=dict)
+    scrape_complete: bool = False
+    parent_account_id: str | None = None
+    generated_at: str = ""
+
+    def add(self, proposal: Proposal) -> None:
+        self.proposals.append(proposal)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _classify_care_types(offerings: list[str]) -> tuple[list[str], list[str]]:
+    """Split website offerings into canonical CRM values and everything else."""
+    supported: list[str] = []
+    unsupported: list[str] = []
+    seen: set[str] = set()
+    for raw in offerings:
+        text = (raw or "").strip()
+        if not text:
+            continue
+        canonical = _SUPPORTED_CARE_BY_KEY.get(text.casefold())
+        if canonical:
+            if canonical not in seen:
+                supported.append(canonical)
+                seen.add(canonical)
+        else:
+            unsupported.append(text)
+    return supported, unsupported
+
+
+def _safe_writable_care_type(offerings: list[str]) -> str | None:
+    """The one CRM care_type that can be written, or None when a human must choose."""
+    supported, unsupported = _classify_care_types(offerings)
+    if len(supported) == 1 and not unsupported:
+        return supported[0]
+    return None
+
+
+def _website_field_values(facility: Facility) -> dict[str, str]:
+    values = {
+        fields.NAME: facility.name or "",
+        fields.STREET: facility.street or "",
+        fields.CITY: facility.city or "",
+        fields.STATE: (facility.state or "").upper(),
+        fields.ZIP: facility.zip or "",
+        fields.PHONE: facility.phone or "",
+    }
+    care_type = _safe_writable_care_type(facility.care_types)
+    if care_type:
+        values[fields.CARE_TYPE] = care_type
+    return values
+
+
+def _care_type_needs_review(offerings: list[str]) -> bool:
+    if not any((item or "").strip() for item in offerings):
+        return False
+    return _safe_writable_care_type(offerings) is None
+
+
+def _account_field_values(account: dict[str, Any]) -> dict[str, Any]:
+    return {key: account.get(key, fields.UNSET) for key in COMPARABLE_FIELDS}
+
+
+def _normalized_equal(field_name: str, left: Any, right: Any) -> bool:
+    if field_name == fields.NAME:
+        return normalize_name_for_comparison(left) == normalize_name_for_comparison(right)
+    if field_name == fields.STREET:
+        return normalize_street_for_comparison(left) == normalize_street_for_comparison(right)
+    if field_name == fields.ZIP:
+        return normalize_zip(left) == normalize_zip(right)
+    if field_name == fields.STATE:
+        return (str(left or "").strip().upper()[:2]) == (str(right or "").strip().upper()[:2])
+    if field_name == fields.CITY:
+        return str(left or "").strip().lower() == str(right or "").strip().lower()
+    if field_name == fields.CARE_TYPE:
+        return str(left or "").strip().lower() == str(right or "").strip().lower()
+    if field_name == fields.PHONE:
+        left_digits = "".join(ch for ch in str(left or "") if ch.isdigit())
+        right_digits = "".join(ch for ch in str(right or "") if ch.isdigit())
+        if not left_digits or not right_digits:
+            return not left_digits and not right_digits
+        return left_digits == right_digits
+    return str(left or "").strip() == str(right or "").strip()
+
+
+def _field_diffs(facility: Facility, account: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    website = _website_field_values(facility)
+    current = _account_field_values(account)
+    cur_out: dict[str, Any] = {}
+    prop_out: dict[str, Any] = {}
+    for key in COMPARABLE_FIELDS:
+        web_val = website.get(key, "")
+        crm_val = current.get(key, "")
+        if not web_val and not fields.is_set(crm_val):
+            continue
+        if not web_val:
+            # Website has no value; do not clear CRM fields automatically.
+            continue
+        if _normalized_equal(key, web_val, crm_val):
+            continue
+        cur_out[key] = crm_val
+        prop_out[key] = web_val
+    return cur_out, prop_out
+
+
+def _is_bellhaven_child(account: dict[str, Any], parent_id: str) -> bool:
+    return str(account.get(fields.PARENT_ID) or "") == parent_id
+
+
+def _add_care_type_review(
+    batch: ProposalBatch,
+    facility: Facility,
+    *,
+    account_id: str | None,
+    current_care_type: Any = "",
+) -> None:
+    """Review-only. Never chooses a care_type and never proposes a composite."""
+    if not _care_type_needs_review(facility.care_types):
+        return
+    supported, unsupported = _classify_care_types(facility.care_types)
+    current = {fields.CARE_TYPE: current_care_type} if account_id else {}
+    batch.add(
+        Proposal(
+            action_type=ACTION_REVIEW_CARE_TYPE,
+            account_id=account_id,
+            facility_url=facility.url,
+            current_values=current,
+            proposed_values={},
+            evidence={
+                "website_care_types": list(facility.care_types),
+                "supported_care_types": supported,
+                "unsupported_care_types": unsupported,
+                "facility_name": facility.name,
+            },
+            confidence="review",
+            requires_review=True,
+            reason=(
+                "website care offerings are not a single supported CRM care_type; "
+                "do not write a composite or choose one automatically"
+            ),
+        )
+    )
+
+
+def generate_proposals(
+    *,
+    scrape: ScrapeResult,
+    accounts: list[dict[str, Any]],
+    matches: list[MatchResult],
+    parent: ParentResolution,
+    duplicates: list[DuplicateGroup],
+) -> ProposalBatch:
+    """Build a conservative proposal batch from scrape + CRM evidence."""
+    batch = ProposalBatch(
+        scrape_complete=scrape.complete,
+        parent_account_id=parent.account_id if parent.resolved else None,
+        generated_at=_now(),
+        blockers=list(scrape.blockers),
+    )
+    if parent.blocker:
+        batch.blockers.append(parent.blocker)
+
+    parent_ok = parent.resolved
+    scrape_ok = scrape.complete
+
+    matched_account_ids: set[str] = set()
+    matched_facility_urls: set[str] = set()
+    # Ambiguous candidates are website-associated for stale detection only.
+    website_associated_ids: set[str] = set()
+
+    for result in matches:
+        facility = result.facility
+        if result.ambiguous:
+            batch.add(
+                Proposal(
+                    action_type=ACTION_REVIEW_AMBIGUOUS,
+                    account_id=None,
+                    facility_url=facility.url,
+                    current_values={},
+                    proposed_values={},
+                    evidence={
+                        "tier": result.tier,
+                        "name_similarity": result.name_similarity,
+                        "reasons": list(result.reasons),
+                        "candidate_account_ids": list(result.candidate_account_ids),
+                        "runners_up": [asdict(c) for c in result.runners_up],
+                        "facility_name": facility.name,
+                    },
+                    confidence="ambiguous",
+                    requires_review=True,
+                    reason="ambiguous match; no automatic account update",
+                )
+            )
+            matched_facility_urls.add(facility.url)
+            # Full candidate set, not the truncated display runners.
+            for account_id in result.candidate_account_ids:
+                if account_id:
+                    website_associated_ids.add(str(account_id))
+            continue
+
+        if result.account is None:
+            continue
+
+        account = result.account
+        account_id = str(account.get(fields.ACCOUNT_ID))
+        matched_account_ids.add(account_id)
+        matched_facility_urls.add(facility.url)
+
+        # Parent / CHOW decisions only when we know the correct Bellhaven parent.
+        # Until that parent is known, or while ownership is unresolved / two-step
+        # CHOW, the old account must not receive an independently approvable field
+        # update. A later parent may require CHOW, and that write surface is only
+        # chow_current_account. Direct re-parent (parent known, no CHOW) may still
+        # update fields.
+        suppress_old_account_field_updates = not parent_ok
+        current_parent = str(account.get(fields.PARENT_ID) or "")
+        if parent_ok and parent.account_id and current_parent != parent.account_id:
+            decision = chow.decide_parent_change(account, target_parent_id=parent.account_id)
+            if decision.kind == chow.KIND_HUMAN_REVIEW:
+                suppress_old_account_field_updates = True
+                batch.add(
+                    Proposal(
+                        action_type=ACTION_REVIEW_CHOW,
+                        account_id=account_id,
+                        facility_url=facility.url,
+                        current_values={
+                            fields.PARENT_ID: current_parent,
+                            fields.LIFETIME_REVENUE: decision.lifetime_revenue,
+                            fields.OUTSTANDING_AR: decision.outstanding_ar,
+                        },
+                        proposed_values={fields.PARENT_ID: parent.account_id},
+                        evidence={
+                            "chow_kind": decision.kind,
+                            "match_tier": result.tier,
+                            "match_reasons": list(result.reasons),
+                        },
+                        confidence="review",
+                        requires_review=True,
+                        reason=decision.reason,
+                    )
+                )
+            elif decision.kind == chow.KIND_CHOW_TWO_STEP:
+                suppress_old_account_field_updates = True
+                batch.add(
+                    Proposal(
+                        action_type=ACTION_CHOW,
+                        account_id=account_id,
+                        facility_url=facility.url,
+                        current_values={
+                            fields.PARENT_ID: current_parent,
+                            fields.NAME: account.get(fields.NAME),
+                            fields.STREET: account.get(fields.STREET),
+                            fields.CITY: account.get(fields.CITY),
+                            fields.STATE: account.get(fields.STATE),
+                            fields.ZIP: account.get(fields.ZIP),
+                            fields.LIFETIME_REVENUE: decision.lifetime_revenue,
+                            fields.OUTSTANDING_AR: decision.outstanding_ar,
+                        },
+                        proposed_values={
+                            "new_account_parent_id": parent.account_id,
+                            "new_account_template": _website_field_values(facility),
+                            "old_account_patch": {fields.CHOW_CURRENT_ACCOUNT: "<new_account_id>"},
+                            "old_account_unchanged": [
+                                fields.PARENT_ID,
+                                fields.STATUS,
+                                fields.NOTE,
+                                fields.NAME,
+                                fields.STREET,
+                                fields.CITY,
+                                fields.STATE,
+                                fields.ZIP,
+                            ],
+                        },
+                        evidence={
+                            "chow_kind": decision.kind,
+                            "match_tier": result.tier,
+                            "match_reasons": list(result.reasons),
+                            "website_care_types": list(facility.care_types),
+                        },
+                        confidence=result.confidence,
+                        requires_review=True,
+                        reason=decision.reason,
+                    )
+                )
+            else:
+                batch.add(
+                    Proposal(
+                        action_type=ACTION_REPARENT,
+                        account_id=account_id,
+                        facility_url=facility.url,
+                        current_values={fields.PARENT_ID: current_parent},
+                        proposed_values={fields.PARENT_ID: parent.account_id},
+                        evidence={
+                            "chow_kind": decision.kind,
+                            "match_tier": result.tier,
+                            "match_reasons": list(result.reasons),
+                            "lifetime_revenue": decision.lifetime_revenue,
+                            "outstanding_ar": decision.outstanding_ar,
+                        },
+                        confidence=result.confidence,
+                        requires_review=True,
+                        reason=decision.reason,
+                    )
+                )
+
+        if not suppress_old_account_field_updates:
+            current_diff, proposed_diff = _field_diffs(facility, account)
+            if current_diff:
+                batch.add(
+                    Proposal(
+                        action_type=ACTION_UPDATE_FIELDS,
+                        account_id=account_id,
+                        facility_url=facility.url,
+                        current_values=current_diff,
+                        proposed_values=proposed_diff,
+                        evidence={
+                            "match_tier": result.tier,
+                            "match_confidence": result.confidence,
+                            "match_reasons": list(result.reasons),
+                            "name_similarity": result.name_similarity,
+                            "facility_name": facility.name,
+                        },
+                        confidence=result.confidence,
+                        requires_review=True,
+                        reason="website values differ from CRM on normalized comparison",
+                    )
+                )
+
+        # Status stays out of COMPARABLE_FIELDS. An inactive match is review-only
+        # and never proposes reactivation, including when field updates are suppressed.
+        if str(account.get(fields.STATUS) or "").strip() == fields.STATUS_INACTIVE:
+            batch.add(
+                Proposal(
+                    action_type=ACTION_REVIEW_INACTIVE,
+                    account_id=account_id,
+                    facility_url=facility.url,
+                    current_values={fields.STATUS: fields.STATUS_INACTIVE},
+                    proposed_values={},
+                    evidence={
+                        "match_tier": result.tier,
+                        "match_reasons": list(result.reasons),
+                        "facility_name": facility.name,
+                        "status": fields.STATUS_INACTIVE,
+                    },
+                    confidence="review",
+                    requires_review=True,
+                    reason=(
+                        "website facility exists and matches this CRM account, "
+                        "but the CRM account is inactive"
+                    ),
+                )
+            )
+
+        _add_care_type_review(
+            batch,
+            facility,
+            account_id=account_id,
+            current_care_type=account.get(fields.CARE_TYPE, ""),
+        )
+
+    # Unmatched website facilities → create only when scrape + parent are trusted.
+    for result in matches:
+        if result.account is not None or result.ambiguous:
+            continue
+        facility = result.facility
+        if facility.url in matched_facility_urls:
+            continue
+        if not scrape_ok or not parent_ok:
+            continue
+        batch.add(
+            Proposal(
+                action_type=ACTION_CREATE_ACCOUNT,
+                account_id=None,
+                facility_url=facility.url,
+                current_values={},
+                proposed_values={
+                    **_website_field_values(facility),
+                    fields.PARENT_ID: parent.account_id,
+                    fields.STATUS: fields.STATUS_ACTIVE,
+                },
+                evidence={
+                    "facility_name": facility.name,
+                    "sources": list(facility.sources),
+                    "match_reasons": list(result.reasons),
+                    "website_care_types": list(facility.care_types),
+                },
+                confidence="medium",
+                requires_review=True,
+                reason="website facility has no safe CRM match; propose new Bellhaven child",
+            )
+        )
+        _add_care_type_review(batch, facility, account_id=None)
+
+    # Possible stale Bellhaven children: only when scrape is complete.
+    if scrape_ok and parent_ok and parent.account_id:
+        for account in accounts:
+            account_id = str(account.get(fields.ACCOUNT_ID) or "")
+            if not account_id or account_id in matched_account_ids:
+                continue
+            if account_id in website_associated_ids:
+                continue
+            if account_id == parent.account_id:
+                continue
+            if not _is_bellhaven_child(account, parent.account_id):
+                continue
+            batch.add(
+                Proposal(
+                    action_type=ACTION_REVIEW_STALE,
+                    account_id=account_id,
+                    facility_url=None,
+                    current_values=_account_field_values(account),
+                    proposed_values={},
+                    evidence={
+                        "parent_id": parent.account_id,
+                        "status": account.get(fields.STATUS),
+                    },
+                    confidence="review",
+                    requires_review=True,
+                    reason=(
+                        "Bellhaven CRM child has no website match on a complete "
+                        "scrape; review as possible stale/missing-on-site"
+                    ),
+                )
+            )
+
+    for group in duplicates:
+        ids = [str(a.get(fields.ACCOUNT_ID)) for a in group.accounts]
+        batch.add(
+            Proposal(
+                action_type=ACTION_REVIEW_DUPLICATE,
+                account_id=ids[0] if ids else None,
+                facility_url=None,
+                current_values={
+                    "account_ids": ids,
+                    "accounts": [
+                        {
+                            fields.ACCOUNT_ID: a.get(fields.ACCOUNT_ID),
+                            fields.NAME: a.get(fields.NAME),
+                            fields.STREET: a.get(fields.STREET),
+                            fields.CITY: a.get(fields.CITY),
+                            fields.STATE: a.get(fields.STATE),
+                            fields.ZIP: a.get(fields.ZIP),
+                        }
+                        for a in group.accounts
+                    ],
+                },
+                proposed_values={},
+                evidence={"duplicate_key": group.key, "duplicate_reason": group.reason},
+                confidence="review",
+                requires_review=True,
+                reason=f"possible duplicate accounts: {group.reason}",
+            )
+        )
+
+    batch.summary = _summarize(batch)
+    return batch
+
+
+def _summarize(batch: ProposalBatch) -> dict[str, int]:
+    counts = {
+        "proposals": len(batch.proposals),
+        "update_fields": 0,
+        "create_account": 0,
+        "reparent": 0,
+        "chow_create_and_link": 0,
+        "review_ambiguous": 0,
+        "review_duplicate": 0,
+        "review_stale_or_missing": 0,
+        "review_chow_ambiguous": 0,
+        "review_inactive_account": 0,
+        "review_care_type": 0,
+        "blockers": len(batch.blockers),
+    }
+    for proposal in batch.proposals:
+        if proposal.action_type in counts:
+            counts[proposal.action_type] += 1
+    return counts

@@ -22,6 +22,11 @@ READ_ONLY_MODULES = (
     f"{PACKAGE}.pipeline",
     f"{PACKAGE}.scraper",
     f"{PACKAGE}.matching",
+    f"{PACKAGE}.proposals",
+    f"{PACKAGE}.chow",
+    f"{PACKAGE}.store",
+    f"{PACKAGE}.review_app",
+    f"{PACKAGE}.cli",
     f"{PACKAGE}.rules",
 )
 

@@ -1,6 +1,46 @@
 from __future__ import annotations
 
-from bellhaven_sync.normalize import normalize_location, normalize_name, normalize_street, normalize_zip
+from bellhaven_sync.normalize import (
+    normalize_location,
+    normalize_name,
+    normalize_name_for_comparison,
+    normalize_street,
+    normalize_street_for_comparison,
+    normalize_zip,
+)
+
+
+def test_comparison_name_keeps_qualifiers_matching_name_strips():
+    memory = "Bellhaven Memory Care of Tiffin"
+    assisted = "Bellhaven Assisted Living of Tiffin"
+    assert normalize_name(memory) == normalize_name(assisted)
+    assert normalize_name_for_comparison(memory) != normalize_name_for_comparison(assisted)
+    assert normalize_name_for_comparison("Bellhaven   of   Tiffin") == normalize_name_for_comparison(
+        "Bellhaven of Tiffin"
+    )
+    assert normalize_name_for_comparison("Bellhaven of Tiffin (Memory Care)") != normalize_name_for_comparison(
+        "Bellhaven of Tiffin"
+    )
+    assert normalize_name_for_comparison("Bellhaven of Tiffin (Memory Care)") != normalize_name_for_comparison(
+        "Bellhaven of Tiffin (Assisted Living)"
+    )
+
+
+def test_suite_hash_identifier_canonicalizes_with_plain_suite():
+    suite = normalize_street_for_comparison("100 Main St Suite 200")
+    assert normalize_street_for_comparison("100 Main St Suite #200") == suite
+    assert normalize_street_for_comparison("100 Main Street Ste. #200") == suite
+    assert normalize_street_for_comparison("100 Main St Unit #2") == normalize_street_for_comparison(
+        "100 Main St #2"
+    )
+    assert normalize_street_for_comparison("100 Main St Suite #200") != normalize_street_for_comparison(
+        "100 Main St Suite #100"
+    )
+    assert normalize_street_for_comparison("100 Stevens Street") == ("100", "stevens st")
+    assert normalize_street_for_comparison("100 Steele Street") == ("100", "steele st")
+    assert normalize_street("100 Main St Suite #200") == normalize_street("100 Main St")
+    assert normalize_street("100 Stevens Street") == ("100", "stevens st")
+    assert normalize_street("100 Steele Street") == ("100", "steele st")
 
 
 def test_name_strips_filler_phrases_and_parent_suffix():
@@ -41,6 +81,26 @@ def test_street_names_starting_with_ste_are_not_unit_designators():
     assert normalize_street("100 Stevens Street") == ("100", "stevens st")
     assert normalize_street("100 Steele Street") == ("100", "steele st")
     assert normalize_street("100 Stevens Street") != normalize_street("100 Main St Ste 200")
+
+
+def test_comparison_keeps_unit_identifiers_and_canonicalizes_designators():
+    assert normalize_street_for_comparison("100 Main Street Suite 200") == normalize_street_for_comparison(
+        "100 Main St Ste. 200"
+    )
+    assert normalize_street_for_comparison("100 Main St Apartment 2") == normalize_street_for_comparison(
+        "100 Main Street Apt. 2"
+    )
+    assert normalize_street_for_comparison("100 Main St #2") == normalize_street_for_comparison(
+        "100 Main Street Unit 2"
+    )
+    assert normalize_street_for_comparison("100 Main St Suite 200") != normalize_street_for_comparison(
+        "100 Main St Suite 100"
+    )
+    assert normalize_street_for_comparison("100 Main St Apt 2") != normalize_street_for_comparison(
+        "100 Main St Apt 3"
+    )
+    # Matching still drops the unit so these remain the same physical address.
+    assert normalize_street("100 Main St Suite 200") == normalize_street("100 Main St Suite 100")
 
 
 def test_unit_suffix_forms_normalize_equivalently_to_bare_street():

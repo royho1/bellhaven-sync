@@ -1,8 +1,7 @@
 """Command line entry point.
 
-Phase 0 ships one command, `discover`, which is strictly read-only. Later
-phases add `scrape`, `sync`, and `serve`. `sync` will never be able to write:
-it does not import the apply module.
+Commands: ``discover``, ``scrape``, ``sync``, ``serve``. ``sync`` and ``serve``
+are read-only with respect to the CRM: they never import the apply module.
 """
 
 from __future__ import annotations
@@ -61,6 +60,41 @@ def cmd_scrape(args: argparse.Namespace) -> int:
     return 0 if result.complete else 3
 
 
+def cmd_sync(args: argparse.Namespace) -> int:
+    from . import pipeline
+    from .store import default_db_path
+
+    settings = load_settings()
+    db_path = args.db or default_db_path(settings.data_dir)
+    result = pipeline.run_sync(
+        settings,
+        base_url=args.base_url,
+        db_path=db_path,
+        enrich_pages=not args.urls_only,
+    )
+    print(pipeline.format_sync_summary(result))
+    return 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    from .config import load_local_paths
+    from .review_app import LoopbackHostError, run_server
+    from .store import default_db_path
+
+    # Review UI only needs the local SQLite file; no CRM token required.
+    paths = load_local_paths()
+    db_path = args.db or default_db_path(paths.data_dir)
+    print(f"Serving review UI from {db_path}")
+    print("Approve/reject updates SQLite only. No CRM writes.")
+    print("Bind is loopback-only (127.0.0.1, localhost, or ::1).")
+    try:
+        run_server(db_path, host=args.host, port=args.port)
+    except LoopbackHostError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bellhaven-sync", description=__doc__)
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
@@ -88,6 +122,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip fetching individual facility pages (faster, less detail)",
     )
     scrape.set_defaults(func=cmd_scrape)
+
+    sync = subparsers.add_parser(
+        "sync",
+        help="read-only: scrape + CRM read + match + persist proposals (no CRM writes)",
+    )
+    sync.add_argument("--base-url", default=scraper_default_base())
+    sync.add_argument("--db", default=None, help="SQLite path (default: data/bellhaven_sync.db)")
+    sync.add_argument(
+        "--urls-only",
+        action="store_true",
+        help="skip facility-page enrichment while discovering URLs",
+    )
+    sync.set_defaults(func=cmd_sync)
+
+    serve = subparsers.add_parser(
+        "serve",
+        help="local-only Flask review UI on loopback; approve/reject updates SQLite only",
+    )
+    serve.add_argument("--db", default=None, help="SQLite path (default: data/bellhaven_sync.db)")
+    serve.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="loopback bind address only: 127.0.0.1, localhost, or ::1",
+    )
+    serve.add_argument("--port", type=int, default=5055)
+    serve.set_defaults(func=cmd_serve)
 
     return parser
 
