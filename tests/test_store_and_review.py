@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import re
+
+import pytest
+
 from bellhaven_sync.proposals import (
     ACTION_UPDATE_FIELDS,
     STATUS_APPROVED,
@@ -12,6 +16,12 @@ from bellhaven_sync.proposals import (
 )
 from bellhaven_sync.review_app import create_app
 from bellhaven_sync.store import ProposalStore
+
+
+def _csrf_token(html: bytes) -> str:
+    match = re.search(rb'name="csrf_token" value="([^"]+)"', html)
+    assert match, "CSRF token missing from review page"
+    return match.group(1).decode()
 
 
 def _batch(*proposals: Proposal) -> ProposalBatch:
@@ -108,10 +118,15 @@ def test_review_ui_approve_updates_sqlite_only(tmp_path):
     assert listing.status_code == 200
     assert b"city differs" in listing.data
     assert b"Viewing reconciliation run" in listing.data
+    token = _csrf_token(listing.data)
 
     response = client.post(
         f"/proposals/{proposal.id}/status",
-        data={"status": "approved", "return_run_id": str(proposal.run_id)},
+        data={
+            "status": "approved",
+            "return_run_id": str(proposal.run_id),
+            "csrf_token": token,
+        },
         follow_redirects=True,
     )
     assert response.status_code == 200
@@ -175,6 +190,7 @@ def test_review_ui_defaults_to_latest_run_only(tmp_path):
             "status": "approved",
             "return_run_id": str(run1),
             "return_status": "",
+            "csrf_token": _csrf_token(historical.data),
         },
         follow_redirects=True,
     )
@@ -184,3 +200,90 @@ def test_review_ui_defaults_to_latest_run_only(tmp_path):
     assert b"#1" in approved.data or b"run #1" in approved.data.lower() or b"(historical)" in approved.data
     assert b"new-run-pending" not in approved.data
     assert b"old-run-pending" in approved.data
+
+
+def test_status_post_requires_valid_csrf_token(tmp_path):
+    db = tmp_path / "csrf.sqlite"
+    store = ProposalStore(db)
+    run_id = store.save_run(
+        _batch(
+            Proposal(
+                action_type=ACTION_UPDATE_FIELDS,
+                account_id="A1",
+                facility_url="https://example.test/a",
+                current_values={"city": "Old"},
+                proposed_values={"city": "New"},
+                evidence={"reason": "csrf-target"},
+                confidence="high",
+            )
+        )
+    )
+    proposal = store.list_proposals(run_id=run_id)[0]
+    app = create_app(db)
+    client = app.test_client()
+    page = client.get(f"/?run_id={run_id}&status=pending&action_type=update_fields")
+    token = _csrf_token(page.data)
+
+    missing = client.post(
+        f"/proposals/{proposal.id}/status",
+        data={
+            "status": "approved",
+            "return_run_id": str(run_id),
+            "return_status": "pending",
+            "return_action_type": "update_fields",
+        },
+    )
+    assert missing.status_code == 403
+    assert store.get_proposal(proposal.id).status == STATUS_PENDING
+
+    wrong = client.post(
+        f"/proposals/{proposal.id}/status",
+        data={
+            "status": "approved",
+            "return_run_id": str(run_id),
+            "return_status": "pending",
+            "return_action_type": "update_fields",
+            "csrf_token": "not-the-session-token",
+        },
+    )
+    assert wrong.status_code == 403
+    assert store.get_proposal(proposal.id).status == STATUS_PENDING
+
+    rejected = client.post(
+        f"/proposals/{proposal.id}/status",
+        data={
+            "status": "rejected",
+            "return_run_id": str(run_id),
+            "return_status": "pending",
+            "return_action_type": "update_fields",
+            "csrf_token": token,
+        },
+        follow_redirects=False,
+    )
+    assert rejected.status_code == 302
+    location = rejected.headers["Location"]
+    assert f"run_id={run_id}" in location
+    assert "status=pending" in location
+    assert "action_type=update_fields" in location
+    assert store.get_proposal(proposal.id).status == STATUS_REJECTED
+
+
+def test_serve_rejects_non_loopback_hosts(tmp_path, capsys):
+    from bellhaven_sync.cli import main
+    from bellhaven_sync.review_app import LoopbackHostError, normalize_loopback_host, run_server
+
+    assert normalize_loopback_host("127.0.0.1") == "127.0.0.1"
+    assert normalize_loopback_host("localhost") == "localhost"
+    assert normalize_loopback_host("::1") == "::1"
+    assert normalize_loopback_host("[::1]") == "::1"
+
+    db = tmp_path / "local.sqlite"
+    for host in ("0.0.0.0", "192.168.1.20", "example.com"):
+        with pytest.raises(LoopbackHostError):
+            run_server(db, host=host)
+
+    code = main(["serve", "--host", "0.0.0.0", "--db", str(db)])
+    assert code == 2
+    captured = capsys.readouterr()
+    assert "loopback" in captured.err.lower()
+    assert "0.0.0.0" in captured.err

@@ -40,7 +40,9 @@ that could carry it passes through `redact()` first.
 # Never POSTs or PATCHes the CRM.
 .venv/bin/python -m bellhaven_sync.cli sync
 
-# Local review UI. Approve/reject updates SQLite only; never calls the CRM.
+# Local review UI, loopback only (127.0.0.1, localhost, or ::1).
+# Approve/reject updates SQLite only and requires the page CSRF token.
+# Never calls the CRM. Non-loopback hosts such as 0.0.0.0 are refused.
 .venv/bin/python -m bellhaven_sync.cli serve
 ```
 
@@ -48,8 +50,8 @@ that could carry it passes through `redact()` first.
 
 1. Run `sync` to scrape the site, read CRM accounts, match, and persist proposals
    under `data/bellhaven_sync.db`.
-2. Run `serve` and open `http://127.0.0.1:5055`.
-3. Filter by status / action type, then Approve or Reject.
+2. Run `serve` and open `http://127.0.0.1:5055`. The server refuses non-loopback binds.
+3. Filter by status / action type, then Approve or Reject. Those posts carry a session CSRF token.
 4. Decisions stay in SQLite. Branch 4 will apply only approved items.
 
 ## Tests

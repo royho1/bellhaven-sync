@@ -104,14 +104,26 @@ Four branches, each reviewed and merged before the next starts:
   3. Two-step CHOW suppresses `update_fields` on the old account; website values
      live only in `new_account_template`, and the old account patch is solely
      `chow_current_account`.
-  4. Ambiguous candidate account IDs are website-associated for stale detection
-     only (never auto-updated / re-parented).
-  5. SQLite `data/bellhaven_sync.db` stores runs + proposals; new runs insert rows
+  4. Unresolved CHOW (`KIND_HUMAN_REVIEW`: wrong parent, `lifetime_revenue == 0`,
+     `outstanding_ar > 0`) also suppresses `update_fields` on that old account.
+     The pipeline still emits only `review_chow_ambiguous`. No auto-reparent and
+     no auto-CHOW. Direct re-parent may still emit normal field updates.
+  5. Ambiguous facilities store the complete candidate account IDs on
+     `MatchResult.candidate_account_ids`, taken from the full candidate list
+     before display truncation. `runners_up` stays a short evidence list.
+     Stale suppression uses the complete ID set only. Those accounts are not
+     confident matches and get no update, reparent, or CHOW proposals.
+  6. Review status POSTs require a per-session CSRF token (`secrets`, Flask
+     `secret_key` generated at app creation, `secrets.compare_digest`). Missing
+     or wrong tokens return 403 and do not change SQLite.
+  7. `cli serve` / `run_server` bind loopback only (`127.0.0.1`, `localhost`,
+     `::1`). `0.0.0.0`, LAN IPs, and other hosts fail before the server starts.
+  8. SQLite `data/bellhaven_sync.db` stores runs + proposals; new runs insert rows
      and never overwrite prior review status. Review UI defaults to the latest run.
-  6. `cli sync` and `cli serve` are CRM-read-only; approve/reject only updates SQLite.
-  7. Incomplete scrape or unresolved parent suppresses create/stale/parent-move
+  9. `cli sync` and `cli serve` are CRM-read-only; approve/reject only updates SQLite.
+  10. Incomplete scrape or unresolved parent suppresses create/stale/parent-move
      proposals that depend on that certainty.
-- Test suite on this branch: **113 passed**, fixture-based, no network required.
+- Test suite on this branch: **117 passed**, fixture-based, no network required.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
 - Next after a clean merge of PR #3: `feat/apply-and-schedule`.
 

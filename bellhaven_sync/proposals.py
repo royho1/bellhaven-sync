@@ -195,6 +195,7 @@ def generate_proposals(
                         "tier": result.tier,
                         "name_similarity": result.name_similarity,
                         "reasons": list(result.reasons),
+                        "candidate_account_ids": list(result.candidate_account_ids),
                         "runners_up": [asdict(c) for c in result.runners_up],
                         "facility_name": facility.name,
                     },
@@ -204,9 +205,10 @@ def generate_proposals(
                 )
             )
             matched_facility_urls.add(facility.url)
-            for candidate in result.runners_up:
-                if candidate.account_id:
-                    website_associated_ids.add(str(candidate.account_id))
+            # Full candidate set, not the truncated display runners.
+            for account_id in result.candidate_account_ids:
+                if account_id:
+                    website_associated_ids.add(str(account_id))
             continue
 
         if result.account is None:
@@ -218,12 +220,15 @@ def generate_proposals(
         matched_facility_urls.add(facility.url)
 
         # Parent / CHOW decisions only when we know the correct Bellhaven parent.
-        # Two-step CHOW forbids any other old-account field writes.
+        # Unresolved ownership and confirmed two-step CHOW both forbid any other
+        # old-account field writes. A later human decision may still require CHOW,
+        # and an independently approved field update would violate that invariant.
         suppress_old_account_field_updates = False
         current_parent = str(account.get(fields.PARENT_ID) or "")
         if parent_ok and parent.account_id and current_parent != parent.account_id:
             decision = chow.decide_parent_change(account, target_parent_id=parent.account_id)
             if decision.kind == chow.KIND_HUMAN_REVIEW:
+                suppress_old_account_field_updates = True
                 batch.add(
                     Proposal(
                         action_type=ACTION_REVIEW_CHOW,

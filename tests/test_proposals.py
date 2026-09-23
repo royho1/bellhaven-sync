@@ -289,6 +289,35 @@ def test_reparent_still_allows_field_updates():
     assert updates[0].proposed_values[fields.PHONE] == "419-555-9999"
 
 
+def test_unresolved_chow_suppresses_field_updates_until_review():
+    """Human review of ownership must block independent old-account field writes."""
+    facility = _facility(name="Bellhaven of Tiffin Updated", phone="419-555-9999")
+    account = _account(
+        **{
+            fields.PARENT_ID: "WRONG",
+            fields.LIFETIME_REVENUE: 0,
+            fields.OUTSTANDING_AR: 50,
+            fields.NAME: "Bellhaven of Tiffin",
+            fields.PHONE: "419-555-0100",
+        }
+    )
+    matches = match_facilities([facility], [account])
+    assert matches[0].account is not None
+    batch = generate_proposals(
+        scrape=_scrape([facility]),
+        accounts=[account],
+        matches=matches,
+        parent=_parent(),
+        duplicates=[],
+    )
+    reviews = [p for p in batch.proposals if p.action_type == ACTION_REVIEW_CHOW]
+    assert len(reviews) == 1
+    assert reviews[0].account_id == account[fields.ACCOUNT_ID]
+    assert all(p.action_type != ACTION_UPDATE_FIELDS for p in batch.proposals)
+    assert all(p.action_type != ACTION_REPARENT for p in batch.proposals)
+    assert all(p.action_type != ACTION_CHOW for p in batch.proposals)
+
+
 def test_ambiguous_chow_routes_to_review():
     facility = _facility()
     account = _account(**{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 0, fields.OUTSTANDING_AR: 50})
@@ -360,3 +389,52 @@ def test_ambiguous_candidates_are_not_marked_stale():
         p.action_type != ACTION_UPDATE_FIELDS and p.action_type != ACTION_REPARENT
         for p in batch.proposals
     )
+
+
+def test_every_ambiguous_candidate_is_retained_beyond_display_runners():
+    """Five plausible accounts must all stay website-associated, not just the display subset."""
+    facility = _facility()
+    children = [
+        _account(
+            **{
+                fields.ACCOUNT_ID: f"A{i}",
+                fields.NAME: f"Bellhaven of Tiffin {i}",
+                fields.PARENT_ID: "PARENT",
+            }
+        )
+        for i in range(1, 6)
+    ]
+    parent_acct = _account(
+        **{
+            fields.ACCOUNT_ID: "PARENT",
+            fields.PARENT_ID: "",
+            fields.NAME: "Bellhaven Senior Living",
+            fields.STREET: "1 Parent Way",
+            fields.CITY: "Columbus",
+            fields.ZIP: "43004",
+        }
+    )
+    matches = match_facilities([facility], [*children, parent_acct])
+    result = next(match for match in matches if match.facility.url == facility.url)
+    expected_ids = {f"A{i}" for i in range(1, 6)}
+    assert result.ambiguous is True
+    assert result.account is None
+    assert set(result.candidate_account_ids) == expected_ids
+    runner_ids = {candidate.account_id for candidate in result.runners_up}
+    assert runner_ids < expected_ids
+    assert expected_ids - runner_ids
+
+    batch = generate_proposals(
+        scrape=_scrape([facility], complete=True),
+        accounts=[parent_acct, *children],
+        matches=matches,
+        parent=_parent(),
+        duplicates=[],
+    )
+    ambiguous = [p for p in batch.proposals if p.action_type == ACTION_REVIEW_AMBIGUOUS]
+    assert len(ambiguous) == 1
+    assert set(ambiguous[0].evidence["candidate_account_ids"]) == expected_ids
+    stale_ids = {p.account_id for p in batch.proposals if p.action_type == ACTION_REVIEW_STALE}
+    assert stale_ids.isdisjoint(expected_ids)
+    automatic = {ACTION_UPDATE_FIELDS, ACTION_REPARENT, ACTION_CHOW}
+    assert all(p.action_type not in automatic for p in batch.proposals)

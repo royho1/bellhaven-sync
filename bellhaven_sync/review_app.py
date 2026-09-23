@@ -2,14 +2,19 @@
 
 Approve/reject only updates SQLite. This app never calls the CRM.
 The default view shows only the latest reconciliation run.
+Status changes require a per-session CSRF token, and the server binds
+loopback addresses only.
 """
 
 from __future__ import annotations
 
 import json
+import secrets
 from pathlib import Path
 
-from flask import Flask, redirect, render_template_string, request, url_for
+from flask import Flask, redirect, render_template_string, request, session, url_for
+
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 from .proposals import STATUS_APPROVED, STATUS_PENDING, STATUS_REJECTED, STATUS_VALUES
 from .store import ProposalStore, StoredProposal
@@ -159,6 +164,7 @@ PAGE = """
       {% if item.status == 'pending' %}
       <div class="actions">
         <form method="post" action="{{ url_for('set_status', proposal_id=item.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="status" value="approved">
           <input type="hidden" name="return_status" value="{{ status }}">
           <input type="hidden" name="return_action_type" value="{{ action_type }}">
@@ -166,6 +172,7 @@ PAGE = """
           <button class="ok" type="submit">Approve</button>
         </form>
         <form method="post" action="{{ url_for('set_status', proposal_id=item.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="status" value="rejected">
           <input type="hidden" name="return_status" value="{{ status }}">
           <input type="hidden" name="return_action_type" value="{{ action_type }}">
@@ -202,6 +209,39 @@ def _view_item(item: StoredProposal) -> dict:
     }
 
 
+class LoopbackHostError(ValueError):
+    """The review server was asked to bind a non-loopback address."""
+
+
+def normalize_loopback_host(host: str) -> str:
+    """Accept only 127.0.0.1, localhost, or ::1. Bracketed ::1 is normalized."""
+    raw = (host or "").strip()
+    normalized = raw.lower()
+    if normalized.startswith("[") and normalized.endswith("]"):
+        normalized = normalized[1:-1]
+    if normalized not in LOOPBACK_HOSTS:
+        raise LoopbackHostError(
+            "The review server is local-only and refuses non-loopback hosts. "
+            f"Use 127.0.0.1, localhost, or ::1; got {raw!r}."
+        )
+    return normalized
+
+
+def _csrf_token() -> str:
+    token = session.get("csrf_token")
+    if not isinstance(token, str) or not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+def _csrf_matches(submitted: str | None) -> bool:
+    expected = session.get("csrf_token")
+    if not isinstance(expected, str) or not expected or not submitted:
+        return False
+    return secrets.compare_digest(submitted, expected)
+
+
 def _resolve_run_id(store: ProposalStore, raw: str | None) -> int | None:
     latest = store.latest_run_id()
     if latest is None:
@@ -219,6 +259,7 @@ def _resolve_run_id(store: ProposalStore, raw: str | None) -> int | None:
 def create_app(db_path: Path | str) -> Flask:
     store = ProposalStore(db_path)
     app = Flask(__name__)
+    app.secret_key = secrets.token_hex(32)
     app.config["BELLHAVEN_DB_PATH"] = str(db_path)
 
     @app.get("/")
@@ -252,10 +293,13 @@ def create_app(db_path: Path | str) -> Flask:
             selected_run_id=selected_run_id,
             latest_run_id=latest_run_id,
             selected_run_started=(selected_run or {}).get("started_at"),
+            csrf_token=_csrf_token(),
         )
 
     @app.post("/proposals/<int:proposal_id>/status")
     def set_status(proposal_id: int):
+        if not _csrf_matches(request.form.get("csrf_token")):
+            return ("Invalid CSRF token", 403)
         new_status = (request.form.get("status") or "").strip()
         if new_status not in {STATUS_APPROVED, STATUS_REJECTED, STATUS_PENDING}:
             return ("Invalid status", 400)
@@ -273,5 +317,6 @@ def create_app(db_path: Path | str) -> Flask:
 
 
 def run_server(db_path: Path | str, *, host: str = "127.0.0.1", port: int = 5055) -> None:
+    bind_host = normalize_loopback_host(host)
     app = create_app(db_path)
-    app.run(host=host, port=port, debug=False)
+    app.run(host=bind_host, port=port, debug=False)

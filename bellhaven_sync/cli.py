@@ -78,7 +78,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 def cmd_serve(args: argparse.Namespace) -> int:
     from .config import load_local_paths
-    from .review_app import run_server
+    from .review_app import LoopbackHostError, run_server
     from .store import default_db_path
 
     # Review UI only needs the local SQLite file; no CRM token required.
@@ -86,7 +86,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     db_path = args.db or default_db_path(paths.data_dir)
     print(f"Serving review UI from {db_path}")
     print("Approve/reject updates SQLite only. No CRM writes.")
-    run_server(db_path, host=args.host, port=args.port)
+    print("Bind is loopback-only (127.0.0.1, localhost, or ::1).")
+    try:
+        run_server(db_path, host=args.host, port=args.port)
+    except LoopbackHostError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     return 0
 
 
@@ -133,10 +138,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve = subparsers.add_parser(
         "serve",
-        help="local Flask review UI; approve/reject updates SQLite only",
+        help="local-only Flask review UI on loopback; approve/reject updates SQLite only",
     )
     serve.add_argument("--db", default=None, help="SQLite path (default: data/bellhaven_sync.db)")
-    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="loopback bind address only: 127.0.0.1, localhost, or ::1",
+    )
     serve.add_argument("--port", type=int, default=5055)
     serve.set_defaults(func=cmd_serve)
 
