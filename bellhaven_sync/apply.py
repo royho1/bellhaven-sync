@@ -830,7 +830,7 @@ def _account_id(payload: Any) -> str:
 def _post(session: Any, settings: Settings, path: str, body: dict[str, Any]) -> Any:
     url = f"{settings.base_url}/{path.lstrip('/')}"
     try:
-        response = session.post(url, json=body, timeout=DEFAULT_TIMEOUT)
+        response = session.post(url, json=body, timeout=DEFAULT_TIMEOUT, allow_redirects=False)
     except requests.RequestException as exc:
         raise ApplyError(
             f"POST {path} failed before a confirmed response: {exc}. Not retrying.",
@@ -842,7 +842,8 @@ def _post(session: Any, settings: Settings, path: str, body: dict[str, Any]) -> 
 def _patch(session: Any, settings: Settings, account_id: str, body: dict[str, Any]) -> Any:
     url = f"{settings.base_url}/accounts/{account_id}"
     try:
-        response = session.patch(url, json=body, timeout=DEFAULT_TIMEOUT)
+        # A followed 301/302/303 can turn the PATCH into a GET whose 200 looks like success.
+        response = session.patch(url, json=body, timeout=DEFAULT_TIMEOUT, allow_redirects=False)
     except requests.RequestException as exc:
         raise ApplyError(
             f"PATCH /accounts/{account_id} failed before a confirmed response: {exc}. Not retrying.",
