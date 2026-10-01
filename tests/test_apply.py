@@ -2463,3 +2463,39 @@ def test_redirected_patch_stays_uncertain(settings, tmp_path):
     assert report.failed == 1
     assert session.write_allow_redirects == [False]
     assert store.list_attempts(stored.id)[-1].state == STATE_UNCERTAIN
+
+
+def _execute_via_cli(monkeypatch, session, store, run_id):
+    from pathlib import Path
+
+    from bellhaven_sync import apply_cli, config
+
+    monkeypatch.setenv("DRY_RUN", "false")
+    config.load_settings(env_file=Path("/nonexistent/.env"), force=True)
+    monkeypatch.setattr(apply_cli, "build_session", lambda _settings: session)
+    return apply_main(["--execute", "--db", str(store.db_path), "--run-id", str(run_id)])
+
+
+def test_apply_cli_exits_zero_when_everything_applies(settings, tmp_path, monkeypatch):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1"), "PARENT": _parent()})
+    stored = _approve(store, _update_proposal(**{fields.PHONE: "419-555-9999"}))
+    assert _execute_via_cli(monkeypatch, session, store, stored.run_id) == 0
+    assert len(session.patches) == 1
+
+
+def test_apply_cli_exits_nonzero_when_a_proposal_is_blocked(settings, tmp_path, monkeypatch):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1", **{fields.PHONE: "419-555-0000"}), "PARENT": _parent()})
+    stored = _approve(store, _update_proposal(**{fields.PHONE: "419-555-9999"}))
+    assert _execute_via_cli(monkeypatch, session, store, stored.run_id) == 3
+    assert session.patches == []
+
+
+def test_apply_cli_exits_nonzero_on_uncertain_write(settings, tmp_path, monkeypatch, capsys):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    session.lose_post_response = 1
+    stored = _approve(store, _create_proposal())
+    assert _execute_via_cli(monkeypatch, session, store, stored.run_id) == 3
+    assert "1 uncertain" in capsys.readouterr().err
