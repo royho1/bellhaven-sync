@@ -99,7 +99,15 @@ account is already linked to that id, apply treats the CHOW as done. If it
 points somewhere else, apply stops.
 
 Approval status stays `approved`. Application results live in
-`application_attempts` (planned, in progress, applied, blocked, or failed).
+`application_attempts` (planned, in progress, applied, blocked, uncertain, or
+failed). `uncertain` means a write may have reached the CRM without a confirmed
+response. The next execute reconciles it from live CRM state instead of
+writing again.
+
+`apply_cli` exits `0` when every approved proposal was planned, applied, or
+skipped, `2` on a configuration or dry-run refusal, and `3` when any proposal
+ended blocked or uncertain, so a wrapper script can tell a clean run from one
+that needs a person.
 
 ## Architecture / safety decisions
 
@@ -112,6 +120,8 @@ Approval status stays `approved`. Application results live in
   module issues POST/PATCH.
 - Two gates sit in front of a write: `DRY_RUN=false` and `--execute`.
 - POST is not retried. A timeout can mean the account was created.
+- Writes do not follow redirects. A 3xx response is recorded as uncertain
+  rather than success, because a followed redirect can turn a PATCH into a GET.
 - The token is registered for redaction as soon as settings are loaded.
 
 ## Tests
