@@ -7,12 +7,15 @@ anything that might carry it goes through `redact()` first.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://analyst-assessment-production.up.railway.app/api/v1"
 
@@ -89,11 +92,22 @@ def redact(text: object) -> str:
     return result
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def _dry_run_from_env() -> bool:
+    """DRY_RUN is off only when explicitly set to a recognized false value.
+
+    A typo such as ``DRY_RUN=ture`` must not open the write gate, so anything
+    unrecognized keeps dry run on.
+    """
+    raw = (os.environ.get("DRY_RUN") or "").strip().lower()
+    if raw in _FALSE_VALUES:
+        return False
+    if raw and raw not in _TRUE_VALUES:
+        logger.warning("Unrecognized DRY_RUN value %r; keeping dry run on.", raw)
+    return True
 
 
 def _load_dotenv(env_file: Path | None) -> None:
@@ -131,7 +145,7 @@ def load_settings(*, env_file: Path | None = None, force: bool = False) -> Setti
     _settings = Settings(
         api_token=token,
         base_url=base_url,
-        dry_run=_env_flag("DRY_RUN", True),
+        dry_run=_dry_run_from_env(),
         bellhaven_parent_account_id=parent_id,
         data_dir=_data_dir_from_env(),
     )
