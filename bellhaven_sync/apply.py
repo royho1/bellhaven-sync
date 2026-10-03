@@ -600,9 +600,7 @@ def _apply_chow(
         new_id = remembered
     else:
         _require_account(parent_id, session, settings)
-        create_body = {key: template[key] for key in CREATE_FIELDS_ALLOW if key in template}
-        create_body[fields.PARENT_ID] = parent_id
-        create_body[fields.CREATED_BY_CANDIDATE] = True
+        create_body = _chow_expected_create_body(parent_id, template)
         _claim_create_identity(store, create_body, proposal_id=proposal.id, attempt_id=attempt_id)
         recovered = _resolve_create_id(
             create_body,
@@ -636,6 +634,7 @@ def _apply_chow(
 
 
 def _chow_expected_create_body(parent_id: str, template: dict[str, Any]) -> dict[str, Any]:
+    """The CHOW POST body. Successor revalidation compares against this same body."""
     body = {key: template[key] for key in CREATE_FIELDS_ALLOW if key in template}
     body[fields.PARENT_ID] = parent_id
     body[fields.CREATED_BY_CANDIDATE] = True
