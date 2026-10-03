@@ -186,7 +186,7 @@ def iter_accounts(
     **filters: Any,
 ) -> Iterator[dict[str, Any]]:
     """Yield every account, walking pages until a short or empty page arrives."""
-    seen_pages = 0
+    previous: list[dict[str, Any]] | None = None
     for page in range(1, MAX_PAGES + 1):
         payload = get_accounts(
             page=page,
@@ -196,11 +196,15 @@ def iter_accounts(
             **filters,
         )
         items = extract_items(payload)
-        seen_pages += 1
-        for item in items:
-            yield item
+        if items and items == previous:
+            raise CrmError(
+                f"Account page {page} repeated page {page - 1} exactly; the server appears "
+                "to ignore the page parameter. Refusing to treat the account list as complete."
+            )
+        yield from items
         if len(items) < page_size:
             return
+        previous = items
     raise CrmError(
         f"Account pagination did not complete after {MAX_PAGES} full pages "
         f"(page_size={page_size}); refusing to treat the account list as complete."

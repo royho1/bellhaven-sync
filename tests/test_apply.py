@@ -2359,9 +2359,10 @@ def test_create_blocked_when_account_scan_hits_max_pages(settings, tmp_path, mon
             path = url.rstrip("/")
             if path.endswith("/accounts"):
                 page_size = int((params or {}).get("page_size") or 50)
+                start = (int((params or {}).get("page") or 1) - 1) * page_size
                 filler = [
                     _account(f"FILL{i}", **{fields.NAME: f"Filler {i}", fields.STREET: f"{i} Oak St"})
-                    for i in range(page_size)
+                    for i in range(start, start + page_size)
                 ]
                 return FakeResponse({"data": filler})
             return super().get(url, params=params, timeout=timeout)
@@ -2390,9 +2391,10 @@ def test_chow_blocked_when_account_scan_hits_max_pages(settings, tmp_path, monke
             path = url.rstrip("/")
             if path.endswith("/accounts"):
                 page_size = int((params or {}).get("page_size") or 50)
+                start = (int((params or {}).get("page") or 1) - 1) * page_size
                 filler = [
                     _account(f"FILL{i}", **{fields.NAME: f"Filler {i}", fields.STREET: f"{i} Oak St"})
-                    for i in range(page_size)
+                    for i in range(start, start + page_size)
                 ]
                 return FakeResponse({"data": filler})
             return super().get(url, params=params, timeout=timeout)
