@@ -73,7 +73,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
         enrich_pages=not args.urls_only,
     )
     print(pipeline.format_sync_summary(result))
-    return 0
+    # Same code as an incomplete scrape: proposals were saved, but some were withheld.
+    return 3 if result.batch.blockers else 0
 
 
 def cmd_serve(args: argparse.Namespace) -> int:

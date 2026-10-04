@@ -64,3 +64,37 @@ def test_run_sync_persists_proposals(settings, tmp_path):
     summary = pipeline.format_sync_summary(result)
     assert "No CRM writes were attempted." in summary
     assert "Matched:" in summary
+
+
+def _stub_sync(monkeypatch, tmp_path, blockers):
+    from types import SimpleNamespace
+
+    from bellhaven_sync.proposals import ProposalBatch
+
+    batch = ProposalBatch(proposals=[], scrape_complete=not blockers, parent_account_id="PARENT")
+    batch.blockers = list(blockers)
+    result = pipeline.SyncResult(
+        run_id=1,
+        batch=batch,
+        match_count=0,
+        account_count=0,
+        facility_count=0,
+        parent_resolved=True,
+        db_path=tmp_path / "db.sqlite",
+    )
+    monkeypatch.setattr(pipeline, "run_sync", lambda *_args, **_kwargs: result)
+    return SimpleNamespace(base_url=BASE, db=None, urls_only=False)
+
+
+def test_cli_sync_exits_zero_without_blockers(settings, tmp_path, monkeypatch):
+    from bellhaven_sync.cli import cmd_sync
+
+    assert cmd_sync(_stub_sync(monkeypatch, tmp_path, [])) == 0
+
+
+def test_cli_sync_exits_three_when_the_run_has_blockers(settings, tmp_path, monkeypatch, capsys):
+    from bellhaven_sync.cli import cmd_sync
+
+    args = _stub_sync(monkeypatch, tmp_path, ["Scrape incomplete: 34 of 35 communities found."])
+    assert cmd_sync(args) == 3
+    assert "BLOCKER: Scrape incomplete" in capsys.readouterr().out

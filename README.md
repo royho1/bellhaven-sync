@@ -39,7 +39,9 @@ carry it goes through `redact()` first.
    ```
 
 3. **Sync** scrapes, reads the CRM, matches, and stores proposals in SQLite.
-   This command never writes to the CRM.
+   This command never writes to the CRM. It exits `3` when the run has a
+   blocker (incomplete scrape or unresolved parent), the same code `scrape`
+   uses, because some proposals were withheld.
 
    ```bash
    .venv/bin/python -m bellhaven_sync.cli sync
