@@ -95,6 +95,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not an integer") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bellhaven-sync", description=__doc__)
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
@@ -104,7 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
         "discover",
         help="read-only: inspect the live CRM account schema and save a local snapshot",
     )
-    discover.add_argument("--page-size", type=int, default=50)
+    discover.add_argument("--page-size", type=_positive_int, default=50)
     discover.set_defaults(func=cmd_discover)
 
     scrape = subparsers.add_parser(

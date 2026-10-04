@@ -59,6 +59,22 @@ def test_scrape_cli_runs_without_crm_token(monkeypatch, tmp_path: Path):
     assert scrapes, "scrape should write a local facility snapshot without a CRM token"
 
 
+@pytest.mark.parametrize("raw", ["0", "-5", "ten"])
+def test_discover_rejects_non_positive_page_size(raw, capsys):
+    from bellhaven_sync.cli import build_parser
+
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(["discover", "--page-size", raw])
+    assert exc.value.code == 2
+    assert "--page-size" in capsys.readouterr().err
+
+
+def test_discover_accepts_a_positive_page_size():
+    from bellhaven_sync.cli import build_parser
+
+    assert build_parser().parse_args(["discover", "--page-size", "25"]).page_size == 25
+
+
 @pytest.mark.parametrize("raw", [None, "", "true", "TRUE", "1", "yes", "on"])
 def test_dry_run_is_on_by_default_and_for_true_values(monkeypatch, tmp_path: Path, raw):
     if raw is None:
