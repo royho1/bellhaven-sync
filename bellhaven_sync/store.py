@@ -13,14 +13,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .proposals import (
-    ACTION_CHOW,
-    ACTION_CREATE_ACCOUNT,
-    STATUS_APPROVED,
-    STATUS_VALUES,
-    Proposal,
-    ProposalBatch,
-)
 from . import fields
 from .normalize import (
     normalize_city,
@@ -28,6 +20,14 @@ from .normalize import (
     normalize_state,
     normalize_street,
     normalize_zip,
+)
+from .proposals import (
+    ACTION_CHOW,
+    ACTION_CREATE_ACCOUNT,
+    STATUS_APPROVED,
+    STATUS_VALUES,
+    Proposal,
+    ProposalBatch,
 )
 
 SCHEMA_SQL = """
