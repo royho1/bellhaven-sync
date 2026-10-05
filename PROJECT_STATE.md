@@ -90,14 +90,14 @@ Four branches, each reviewed and merged before the next starts:
 `feat/schema-discovery`, `feat/scrape-and-match`, `feat/proposals-and-review`,
 `feat/apply-and-schedule`.
 
-## Current status (2026-09-22)
+## Current status (2026-10-05)
 
 - Branch 1 `feat/schema-discovery` is merged to `main`.
 - Branch 2 `feat/scrape-and-match` is merged to `main` via PR #2 (`4cf89e7`).
 - Branch 3 `feat/proposals-and-review` is merged to `main` via PR #3 (`4c90c07`).
-- Branch 4 `feat/apply-and-schedule` is the final write path. Do not merge it
-  until the Codex review on this branch is clean. Do not run live `--execute`
-  against the assessment API.
+- Branch 4 `feat/apply-and-schedule` is merged to `main` via PR #4 (`5c304da`).
+  Do not run live `--execute` against the assessment API.
+- `fix/post-review-hardening` follows up on PR #4; see the section below.
 - Branch 3 decisions:
   1. Explicit proposal action types in `proposals.py` (update/reparent/CHOW/create/
      ambiguous/duplicate/stale/chow-review/inactive-review/care-type-review).
@@ -201,10 +201,36 @@ Four branches, each reviewed and merged before the next starts:
   26. Create identity locks use parent + normalized name/street/state only.
   27. Remembered CHOW successors are revalidated (parent + canonical identity)
      before linking the old account.
-- Test suite on this branch: **179 passed**, fixture-based, no live POST/PATCH.
 - Live site `bellhavenseniorliving.com` still NXDOMAIN; fixture HTML covers scrape.
 - Real-world limit: execute mode is implemented and tested with fake sessions
   only. It has not been run against the assessment API.
+
+## Post-review hardening (`fix/post-review-hardening`, 2026-09-30 to 2026-10-05)
+
+Addresses the two Codex comments on PR #4 that landed after its last commit,
+plus gaps found while auditing `main`.
+
+1. POST/PATCH pass `allow_redirects=False`. A followed 301/302/303 can turn a
+   PATCH into a GET whose 200 looks like success; a 3xx now stays `uncertain`.
+2. `apply_cli` exits `3` when any proposal ends blocked or uncertain (`0` clean,
+   `1` unexpected error, `2` config or dry-run refusal).
+3. `DRY_RUN` turns off only for `false`/`0`/`no`/`off`. Any unrecognized value
+   (for example `ture`) keeps dry run on and logs a warning.
+4. `iter_accounts` raises as soon as a full page exactly repeats the previous
+   page (server ignoring `page`), instead of walking to `MAX_PAGES`.
+5. `iter_accounts` checks the envelope `total` when a short page ends paging.
+   A server that silently caps `page_size` otherwise looks like a one-page list.
+   Test fakes that simulate the page cap must vary their filler per page.
+6. `cli sync` exits `3` when the batch has blockers, matching `cli scrape`.
+   `scripts/run_scheduled_sync.sh` always prints the log path and then exits
+   with the sync's code.
+7. `discover --page-size` must be a positive integer.
+8. `pyproject.toml` holds ruff (`E4,E7,E9,F,I`) and pytest settings.
+   `.github/workflows/ci.yml` runs `ruff check .` and pytest on PRs and `main`.
+   Ruff's cache can show stale results from another config; use `--no-cache`
+   when the rule set looks wrong.
+
+- Test suite: **233 passed**, fixture-based, no live POST/PATCH.
 
 ## Open questions
 
