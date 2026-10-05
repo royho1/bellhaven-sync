@@ -132,7 +132,8 @@ that needs a person.
 .venv/bin/python -m pytest
 ```
 
-Tests never call the live CRM. HTTP is stubbed.
+Tests never call the live CRM. HTTP is stubbed. CI runs `ruff check .` and
+the test suite on every pull request and on pushes to `main`.
 
 ## Docs
 
