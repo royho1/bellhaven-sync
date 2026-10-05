@@ -18,6 +18,12 @@ python -m bellhaven_sync.cli sync
 
 Logs under `data/` stay on the machine. They are gitignored.
 
+The script always prints the log path, then exits with the sync's own code:
+`0` for a clean run, `3` when the run had blockers (incomplete scrape or
+unresolved parent) and some proposals were withheld, and anything else for a
+failure. Cron mails or logs that output, so a blocked run is visible without
+opening SQLite.
+
 ## Example cron
 
 This timing is an example so the job is easy to install by hand. It is not a
