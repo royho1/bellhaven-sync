@@ -8,6 +8,10 @@ The scheduled sync command never imports this module.
 
     python -m bellhaven_sync.apply_cli
     python -m bellhaven_sync.apply_cli --execute
+
+Exit codes: 0 when every approved proposal was planned, applied, or skipped;
+1 on an unexpected error; 2 on configuration or dry-run refusal; 3 when any
+proposal ended blocked or with an uncertain write outcome.
 """
 
 from __future__ import annotations
@@ -16,6 +20,8 @@ import argparse
 import sys
 
 from .config import ConfigError, build_session, load_settings, redact
+
+EXIT_UNRESOLVED = 3
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -69,6 +75,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: {redact(exc)}", file=sys.stderr)
         return 1
     print(format_apply_report(report))
+    if report.blocked or report.failed:
+        print(
+            f"{report.blocked} blocked and {report.failed} uncertain proposal(s) need attention.",
+            file=sys.stderr,
+        )
+        return EXIT_UNRESOLVED
     return 0
 
 

@@ -15,9 +15,16 @@ if [[ ! -x "$PYTHON" ]]; then
   exit 1
 fi
 
+STATUS=0
 {
   echo "Read-only scheduled sync. CRM writes are not part of this job."
   "$PYTHON" -m bellhaven_sync.cli sync
-} >>"$LOG" 2>&1
+} >>"$LOG" 2>&1 || STATUS=$?
 
 echo "Log: $LOG"
+if [[ "$STATUS" -eq 3 ]]; then
+  echo "Sync finished with blockers; some proposals were withheld. See the log." >&2
+elif [[ "$STATUS" -ne 0 ]]; then
+  echo "Sync failed with exit code ${STATUS}. See the log." >&2
+fi
+exit "$STATUS"

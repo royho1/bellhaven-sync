@@ -14,7 +14,7 @@ import logging
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 from urllib.parse import urljoin, urlparse
 
 import requests

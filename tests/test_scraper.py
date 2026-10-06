@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from bellhaven_sync import scraper
 
 FIXTURES = Path(__file__).parent / "fixtures" / "html"

@@ -68,6 +68,41 @@ def test_pagination_raises_when_max_pages_exhausted_without_terminal_page(settin
     assert len(session.calls) == 3
 
 
+def test_pagination_raises_as_soon_as_a_full_page_repeats(settings):
+    same_page = {"items": [account(1), account(2)]}
+    session = FakeSession([FakeResponse(same_page) for _ in range(5)])
+
+    with pytest.raises(crm_client.CrmError) as exc:
+        list(crm_client.iter_accounts(page_size=2, session=session, settings=settings))
+
+    assert "ignore the page parameter" in str(exc.value)
+    assert len(session.calls) == 2
+
+
+def test_pagination_raises_when_server_caps_page_size_below_total(settings):
+    session = FakeSession(
+        [FakeResponse({"data": [account(1), account(2)], "page": 1, "page_size": 2, "total": 5})]
+    )
+
+    with pytest.raises(crm_client.CrmError) as exc:
+        list(crm_client.iter_accounts(page_size=50, session=session, settings=settings))
+
+    assert "total=5" in str(exc.value)
+
+
+def test_pagination_accepts_a_short_last_page_that_matches_total(settings):
+    session = FakeSession(
+        [
+            FakeResponse({"data": [account(1), account(2)], "total": 3}),
+            FakeResponse({"data": [account(3)], "total": 3}),
+        ]
+    )
+
+    accounts = list(crm_client.iter_accounts(page_size=2, session=session, settings=settings))
+
+    assert [a["id"] for a in accounts] == [1, 2, 3]
+
+
 def test_pagination_handles_a_bare_list_envelope(settings):
     session = FakeSession([FakeResponse([account(1)])])
 

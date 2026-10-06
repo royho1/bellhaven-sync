@@ -14,10 +14,10 @@ from pathlib import Path
 
 from flask import Flask, redirect, render_template_string, request, session, url_for
 
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-
 from .proposals import STATUS_APPROVED, STATUS_PENDING, STATUS_REJECTED, STATUS_VALUES
 from .store import ProposalStore, StoredProposal
+
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 PAGE = """
 <!doctype html>

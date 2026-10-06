@@ -186,7 +186,8 @@ def iter_accounts(
     **filters: Any,
 ) -> Iterator[dict[str, Any]]:
     """Yield every account, walking pages until a short or empty page arrives."""
-    seen_pages = 0
+    previous: list[dict[str, Any]] | None = None
+    yielded = 0
     for page in range(1, MAX_PAGES + 1):
         payload = get_accounts(
             page=page,
@@ -196,15 +197,39 @@ def iter_accounts(
             **filters,
         )
         items = extract_items(payload)
-        seen_pages += 1
-        for item in items:
-            yield item
+        if items and items == previous:
+            raise CrmError(
+                f"Account page {page} repeated page {page - 1} exactly; the server appears "
+                "to ignore the page parameter. Refusing to treat the account list as complete."
+            )
+        yield from items
+        yielded += len(items)
         if len(items) < page_size:
+            _require_reported_total(payload, yielded)
             return
+        previous = items
     raise CrmError(
         f"Account pagination did not complete after {MAX_PAGES} full pages "
         f"(page_size={page_size}); refusing to treat the account list as complete."
     )
+
+
+def _require_reported_total(payload: Any, yielded: int) -> None:
+    """Fail when the envelope's ``total`` says pages were missed.
+
+    A server that silently caps ``page_size`` returns a short first page, which
+    otherwise looks exactly like the last page.
+    """
+    if not isinstance(payload, dict):
+        return
+    total = payload.get("total")
+    if isinstance(total, bool) or not isinstance(total, int):
+        return
+    if yielded < total:
+        raise CrmError(
+            f"Account pagination stopped after {yielded} accounts but the API reported "
+            f"total={total}; refusing to treat the account list as complete."
+        )
 
 
 def get_account(

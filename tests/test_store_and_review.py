@@ -519,12 +519,11 @@ _CHOW_PROPOSED = (
 def test_legacy_uncertain_create_lock_survives_migration(tmp_path, settings):
     import json
     import sqlite3
+    from dataclasses import replace
 
-    from bellhaven_sync import fields
     from bellhaven_sync.apply import run_apply
     from bellhaven_sync.proposals import ACTION_CREATE_ACCOUNT, Proposal, ProposalBatch
-    from dataclasses import replace
-    from tests.test_apply import CrmFake, _account, _parent
+    from tests.test_apply import CrmFake, _parent
 
     db_path = tmp_path / "legacy_uncertain.sqlite"
     conn = sqlite3.connect(db_path)

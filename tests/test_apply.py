@@ -54,6 +54,7 @@ class CrmFake:
         self.write_status_code = 200
         self.write_response_payload: Any | None = None
         self.write_response_text: str | None = None
+        self.write_allow_redirects: list[Any] = []
         self._seq = 1
 
     def get(self, url: str, params: dict[str, Any] | None = None, timeout: Any = None) -> FakeResponse:
@@ -68,9 +69,16 @@ class CrmFake:
             return FakeResponse({"missing": True}, status_code=404, text="missing")
         return FakeResponse(account)
 
-    def post(self, url: str, json: dict[str, Any] | None = None, timeout: Any = None) -> FakeResponse:
+    def post(
+        self,
+        url: str,
+        json: dict[str, Any] | None = None,
+        timeout: Any = None,
+        allow_redirects: Any = True,
+    ) -> FakeResponse:
         body = dict(json or {})
         self.posts.append(body)
+        self.write_allow_redirects.append(allow_redirects)
         if self.post_failures:
             self.post_failures -= 1
             raise requests.ConnectionError(f"post dropped {FAKE_TOKEN}")
@@ -88,10 +96,17 @@ class CrmFake:
             text=self.write_response_text if self.write_response_text is not None else "",
         )
 
-    def patch(self, url: str, json: dict[str, Any] | None = None, timeout: Any = None) -> FakeResponse:
+    def patch(
+        self,
+        url: str,
+        json: dict[str, Any] | None = None,
+        timeout: Any = None,
+        allow_redirects: Any = True,
+    ) -> FakeResponse:
         body = dict(json or {})
         account_id = url.rstrip("/").rsplit("/", 1)[-1]
         self.patches.append((account_id, body))
+        self.write_allow_redirects.append(allow_redirects)
         if self.patch_failures:
             self.patch_failures -= 1
             raise requests.ConnectionError(f"patch dropped {FAKE_TOKEN}")
@@ -2344,9 +2359,10 @@ def test_create_blocked_when_account_scan_hits_max_pages(settings, tmp_path, mon
             path = url.rstrip("/")
             if path.endswith("/accounts"):
                 page_size = int((params or {}).get("page_size") or 50)
+                start = (int((params or {}).get("page") or 1) - 1) * page_size
                 filler = [
                     _account(f"FILL{i}", **{fields.NAME: f"Filler {i}", fields.STREET: f"{i} Oak St"})
-                    for i in range(page_size)
+                    for i in range(start, start + page_size)
                 ]
                 return FakeResponse({"data": filler})
             return super().get(url, params=params, timeout=timeout)
@@ -2375,9 +2391,10 @@ def test_chow_blocked_when_account_scan_hits_max_pages(settings, tmp_path, monke
             path = url.rstrip("/")
             if path.endswith("/accounts"):
                 page_size = int((params or {}).get("page_size") or 50)
+                start = (int((params or {}).get("page") or 1) - 1) * page_size
                 filler = [
                     _account(f"FILL{i}", **{fields.NAME: f"Filler {i}", fields.STREET: f"{i} Oak St"})
-                    for i in range(page_size)
+                    for i in range(start, start + page_size)
                 ]
                 return FakeResponse({"data": filler})
             return super().get(url, params=params, timeout=timeout)
@@ -2419,3 +2436,68 @@ def test_final_3xx_patch_is_not_applied(settings, tmp_path):
     assert store.list_attempts(stored.id)[-1].state == STATE_UNCERTAIN
     assert store.successful_attempt(stored.id) is None
     assert "not confirmed (302)" in (store.list_attempts(stored.id)[-1].error_text or "")
+
+
+def test_writes_never_follow_redirects(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    old = _account(
+        "OLD1",
+        **{fields.PARENT_ID: "WRONG", fields.LIFETIME_REVENUE: 9000, fields.OUTSTANDING_AR: 300},
+    )
+    session = CrmFake({"OLD1": old, "PARENT": _parent(), "WRONG": _wrong_parent()})
+    stored = _approve(store, _chow_proposal())
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.applied == 1
+    assert len(session.posts) == 1
+    assert len(session.patches) == 1
+    assert session.write_allow_redirects == [False, False]
+
+
+def test_redirected_patch_stays_uncertain(settings, tmp_path):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1"), "PARENT": _parent()})
+    session.write_status_code = 303
+    session.write_response_payload = None
+    session.write_response_text = "See Other"
+    stored = _approve(store, _update_proposal(**{fields.PHONE: "419-555-9999"}))
+    report = _run(settings, store, session, stored, execute=True, dry_run=False)
+    assert report.applied == 0
+    assert report.failed == 1
+    assert session.write_allow_redirects == [False]
+    assert store.list_attempts(stored.id)[-1].state == STATE_UNCERTAIN
+
+
+def _execute_via_cli(monkeypatch, session, store, run_id):
+    from pathlib import Path
+
+    from bellhaven_sync import apply_cli, config
+
+    monkeypatch.setenv("DRY_RUN", "false")
+    config.load_settings(env_file=Path("/nonexistent/.env"), force=True)
+    monkeypatch.setattr(apply_cli, "build_session", lambda _settings: session)
+    return apply_main(["--execute", "--db", str(store.db_path), "--run-id", str(run_id)])
+
+
+def test_apply_cli_exits_zero_when_everything_applies(settings, tmp_path, monkeypatch):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1"), "PARENT": _parent()})
+    stored = _approve(store, _update_proposal(**{fields.PHONE: "419-555-9999"}))
+    assert _execute_via_cli(monkeypatch, session, store, stored.run_id) == 0
+    assert len(session.patches) == 1
+
+
+def test_apply_cli_exits_nonzero_when_a_proposal_is_blocked(settings, tmp_path, monkeypatch):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"C1": _account("C1", **{fields.PHONE: "419-555-0000"}), "PARENT": _parent()})
+    stored = _approve(store, _update_proposal(**{fields.PHONE: "419-555-9999"}))
+    assert _execute_via_cli(monkeypatch, session, store, stored.run_id) == 3
+    assert session.patches == []
+
+
+def test_apply_cli_exits_nonzero_on_uncertain_write(settings, tmp_path, monkeypatch, capsys):
+    store = ProposalStore(tmp_path / "db.sqlite")
+    session = CrmFake({"PARENT": _parent()})
+    session.lose_post_response = 1
+    stored = _approve(store, _create_proposal())
+    assert _execute_via_cli(monkeypatch, session, store, stored.run_id) == 3
+    assert "1 uncertain" in capsys.readouterr().err
